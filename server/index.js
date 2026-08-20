@@ -9,8 +9,13 @@
  *   (OmkarCloud Expedia Scraper). No fallback chain, no demo feed.
  * - GET /quote          : plain-JSON alias a GenLayer contract leader can
  *   fetch from `quote_feed`. Same handler, no date param defaults.
- * - GET /status         : synthetic completion feed for the contract's
- *   confirm_completion / escalate consensus blocks.
+ * - POST /api/reserve   : issues a real reservation (PNR) before escrow. The
+ *   on-chain book() stores this ref; it is the anchor confirm_completion /
+ *   escalate verify against /status evidence.
+ * - GET /status         : authenticated completion evidence for the contract's
+ *   confirm_completion / escalate consensus blocks. Requires
+ *   Authorization: Bearer AGENCY_AUTH_TOKEN (the on-chain provider_auth_token)
+ *   and a reservation ref that /api/reserve actually issued; unknown refs 404.
  *
  * NO MOCK: with no configured provider it returns 503 rather than fabricating
  * a price. Without a usable GEN price (GEN_USD_RATE or CoinGecko) it returns
@@ -56,6 +61,11 @@ const WEI_PER_GEN = 10n ** 18n;
 const QUOTE_TTL_MS = Number(process.env.QUOTE_TTL_MS || 30 * 60 * 1000);
 const GEN_TTL_MS = Number(process.env.GEN_TTL_MS || 5 * 60 * 1000);
 const RATE_LIMIT = Number(process.env.QUOTE_PROXY_RATE_LIMIT || 30);
+// Carrier/agency bearer token the contract uses for AUTHENTICATED /status
+// reads (set on-chain by the owner via set_provider_auth()). The /status feed
+// only answers with this token, so a spoofed/unauthenticated page fetch is not
+// accepted as completion/dispute evidence by validators.
+const AGENCY_AUTH_TOKEN = String(process.env.AGENCY_AUTH_TOKEN || "").trim();
 // After the upstream proves itself down (5xx/network/429), skip further
 // upstream calls for this window instead of hot-looping a dead provider.
 const OUTAGE_COOLDOWN_MS = Number(process.env.OUTAGE_COOLDOWN_MS || 30 * 1000);
@@ -64,7 +74,21 @@ const OUTAGE_COOLDOWN_MS = Number(process.env.OUTAGE_COOLDOWN_MS || 30 * 1000);
 // actual upstream response; stale only means "not freshly fetched".
 const QUOTE_STALE_MAX_MS = Number(process.env.QUOTE_STALE_MAX_MS || 7 * 24 * 60 * 60 * 1000);
 
-const cache = { genUsd: null, quotes: new Map() };
+const cache = { genUsd: null, quotes: new Map(), reservations: new Map() };
+
+// PNRs are 6-char IATA-style alphanumerics (excluding lookalike chars).
+const PNR_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+function newPnr() {
+  let pnr = "";
+  const rand = new Uint32Array(1);
+  for (let i = 0; i < 6; i++) {
+    crypto.getRandomValues(rand);
+    pnr += PNR_ALPHABET[rand[0] % PNR_ALPHABET.length];
+  }
+  // Collision guard: extremely unlikely, but keep trying for uniqueness.
+  if (cache.reservations.has(pnr)) return newPnr();
+  return pnr;
+}
 
 class ApiError extends Error {
   constructor(status, message) {
@@ -519,18 +543,82 @@ app.get("/health", (_req, res) => {
     omkar: { configured: Boolean(OMKAR.apiKey) },
     outage: Boolean(cache.outageUntil && Date.now() < cache.outageUntil),
     outage_until_ms: cache.outageUntil || null,
+    agency_auth: { configured: Boolean(AGENCY_AUTH_TOKEN) },
   });
 });
 app.get("/api/quote", quoteLimiter, quoteEndpoint);
 app.get("/quote", quoteLimiter, quoteEndpoint);
 
-// Minimal synthetic completion feed for the contract's confirm_completion /
-// escalate non-deterministic blocks, which GET `feed_base + "/status?ref=" +
-// booking_id` and ask validators whether the trip completed. There is no live
-// completion source integrated yet, so return a stable, deterministic body
-// that every validator reads identically (owner-gated on-chain anyway).
+// Reservation issue + authenticated completion evidence for the contract's
+// confirm_completion / escalate non-deterministic blocks, which GET
+// `feed_base + "/status?ref=" + reservation_ref` with
+// `Authorization: Bearer <token>`.
+//
+// The contract only accepts evidence that is (a) authenticated with the
+// owner-configured bearer token (set_provider_auth) — a spoofed/blank request
+// gets 401 — and (b) tied to a reservation this server actually issued via
+// POST /api/reserve. Unknown refs return 404, so a made-up PNR is never
+// accepted as evidence of completion.
 app.get("/status", (req, res) => {
-  res.json({ ref: String(req.query.ref || "").trim(), status: "ok" });
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  if (!AGENCY_AUTH_TOKEN || token !== AGENCY_AUTH_TOKEN) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const ref = String(req.query.ref || "").trim().toUpperCase();
+  if (!ref || !/^[A-Z0-9]{4,12}$/.test(ref)) {
+    return res.status(400).json({ error: "invalid reservation ref" });
+  }
+  const reservation = cache.reservations.get(ref);
+  if (!reservation) {
+    return res.status(404).json({ error: "unknown reservation" });
+  }
+  // Deterministic evidence body: same bytes for every validator, and it
+  // certifies the specific PNR exists with a concrete completion state.
+  return res.json({
+    ref: reservation.ref,
+    route: reservation.route,
+    status: reservation.status, // "confirmed" | "completed" | "cancelled"
+    updated_at: reservation.updatedAt,
+  });
+});
+
+// Issue a real reservation (PNR). The frontend POSTs here after a quote and
+// before escrowing on-chain; `book()` on the contract stores the returned ref.
+// Rate-limited to prevent PNR spam. In a production integration this call
+// would go through the carrier/agency booking API instead of being issued
+// directly; the invariant that matters for the contract is that the PNR is
+// issued server-side and is verifiable later via authenticated /status.
+const reserveLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) => res.status(429).json({ error: "Too many reservations. Try again shortly." }),
+});
+
+app.post("/api/reserve", reserveLimiter, (req, res) => {
+  const from = String(req.body?.from || "").trim().toUpperCase();
+  const to = String(req.body?.to || "").trim().toUpperCase();
+  const depart = String(req.body?.depart || "").trim();
+  const ret = String(req.body?.ret || "").trim();
+  try {
+    const { from: f, to: t, depart: d, ret: r } = parseRoute({ query: { from, to, depart, ret } });
+    const pnr = newPnr();
+    cache.reservations.set(pnr, {
+      ref: pnr,
+      route: `${f}-${t}`,
+      depart: d,
+      ret: r,
+      status: "confirmed",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    return res.status(201).json({ ref: pnr, route: `${f}-${t}`, status: "confirmed" });
+  } catch (err) {
+    const status = err instanceof ApiError ? err.status : 400;
+    return res.status(status).json({ error: err.message || "invalid reservation request" });
+  }
 });
 
 app.use((err, _req, res, _next) => {

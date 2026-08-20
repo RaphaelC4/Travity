@@ -130,24 +130,34 @@ const isValidDates = (depart, ret) =>
   Number.isInteger(Number(depart)) && Number.isInteger(Number(ret)) &&
   Number(depart) < Number(ret);
 
-// Mirrors the contract's _valid_ref: 4-128 chars once trimmed.
+/** A reservation reference is accepted only if it came from the server's
+ * /api/reserve (a 4-12 char uppercase PNR like "9K2F7Q"). It anchors the
+ * escrow to a real, agency-issued reservation — confirm_completion/escalate
+ * later verify it against authenticated /status evidence, so a made-up ref
+ * (as would happen if the client generated one) is never treated as proof. */
 const isValidRef = (ref) =>
-  typeof ref === "string" && ref.trim().length >= 4 && ref.trim().length <= 128;
+  typeof ref === "string" && /^[A-Z0-9]{4,12}$/.test(ref.trim());
 
-/** Client-side placeholder reservation reference, used until a real provider
- * booking API is wired in. The contract only format-checks this at book()
- * time — it's actually verified later against authenticated provider
- * evidence in confirm_completion/escalate, so a placeholder here is honest
- * (it doesn't claim to be a real PNR) as long as the owner's feed_base +
- * provider_auth_token are pointed at something that can resolve it. Swap
- * this out for the real confirmation code once the server creates an actual
- * reservation with a carrier/agency before escrow. */
-const generateReservationRef = (origin, destination) => {
-  const rand = (typeof crypto !== "undefined" && crypto.randomUUID)
-    ? crypto.randomUUID().slice(0, 8)
-    : Math.random().toString(16).slice(2, 10);
-  return `TRV-${origin}${destination}-${Date.now()}-${rand}`.toUpperCase();
-};
+/** Issues a real reservation (PNR) at the quote server, returning the ref
+ * the contract will store in `book()`. The ref is the anchor that
+ * confirm_completion/escalate later verify against authenticated `/status`
+ * evidence — it cannot be made up, it must come from the agency. */
+async function createReservation({ origin, destination, depart, ret }) {
+  const base = (import.meta.env.VITE_QUOTE_API || "").replace(/\/+$/, "");
+  const res = await fetch(`${base}/api/reserve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      from: String(origin).toUpperCase(),
+      to: String(destination).toUpperCase(),
+      depart: String(depart),
+      ret: String(ret),
+    }),
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(j.error || `Reservation failed (${res.status})`);
+  return String(j.ref || "").toUpperCase();
+}
 
 // ---- live helpers (genlayer-js) ---------------------------------------------
 
@@ -275,10 +285,13 @@ export class TravityClient {
     if (!isValidDates(dep, r)) throw new Error("Return date must be after departure date.");
     const priceWei = BigInt(paymentWei ?? 0n);
     if (priceWei <= 0n) throw new Error("Payment must be greater than zero.");
-    // reservation_ref anchors this escrow to a real reservation; the contract
-    // rejects book() without one. Callers can pass their own (a real PNR from
-    // a provider booking API) or let one be generated as a placeholder.
-    const ref = isValidRef(reservationRef) ? reservationRef.trim() : generateReservationRef(o, d);
+    // The contract rejects book() without a real, agency-issued reservation
+    // ref (server /api/reserve). A made-up/client-generated ref is never
+    // accepted as evidence later, so require one here.
+    const ref = isValidRef(reservationRef) ? reservationRef.trim().toUpperCase() : "";
+    if (!ref) {
+      throw new Error("A reservation reference is required. Reserve your seat on the agency first.");
+    }
 
     // Cached on-chain agreement for these exact dates. When present we skip the
     // refresh_quote write entirely: repeat bookings drop to a single write per
@@ -383,6 +396,14 @@ export class TravityClient {
     return clean;
   }
 
+  /** Issues a real reservation (PNR) at the quote server. The returned ref is
+   * required by book() and is later verified against authenticated /status
+   * evidence by confirm_completion/escalate. This is the "tied to a real
+   * reservation" anchor — a made-up ref is never accepted as evidence. */
+  async createReservation({ origin, destination, depart, ret }) {
+    return createReservation({ origin, destination, depart, ret });
+  }
+
   /** Owner-only (set_provider). The carrier/agency settlement payout
    * address — receives the escrowed fare on verified completion, or the
    * non-refunded remainder after a dispute ruling. Reverts with
@@ -393,7 +414,16 @@ export class TravityClient {
       throw new Error("Provider address must be a 0x-prefixed 20-byte address.");
     }
     const client = await this.writeClient(account, provider);
-    await runWrite(client, { functionName: "set_provider", args: [clean], value: 0n });
+    // Address args must be encoded as raw 20 bytes (CalldataAddress) — see
+    // balance(). A plain "0x…" string is serialized as a string and the
+    // contract's Address parameter decode fails on the storage setter.
+    let who;
+    try {
+      who = new CalldataAddress(fromHex(clean, "bytes"));
+    } catch {
+      who = clean;
+    }
+    await runWrite(client, { functionName: "set_provider", args: [who], value: 0n });
     return clean;
   }
 

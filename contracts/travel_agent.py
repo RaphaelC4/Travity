@@ -58,11 +58,7 @@ class TravelAgent(gl.Contract):
         # as an int (confirmed by the deploy tx: "'int' object has no attribute
         # 'as_bytes'" in the storage setter). Normalize any int/bytes form so the
         # Address descriptor never receives a bare int.
-        if isinstance(owner, int):
-            owner = Address("0x" + format(owner, "040x"))
-        elif isinstance(owner, bytes):
-            owner = Address("0x" + owner.hex())
-        self.owner = owner
+        self.owner = self._normalize_address(owner)
         self.paused = False
         self.killed = False
         # NOTE: quotes/bookings/loyalty/disputes/last_dispute_time are
@@ -77,6 +73,20 @@ class TravelAgent(gl.Contract):
         self.provider_auth_token = ""
 
     # -- Admin ---------------------------------------------------------------
+
+    def _normalize_address(self, addr) -> Address:
+        """GenVM decodes calldata address args (constructor, write-methods)
+        as a raw int, or bytes with the leading zero byte stripped. Normalize
+        every form so the Address storage setter never receives a bare int
+        (see the deploy-tx traceback: 'int' object has no attribute 'as_bytes')."""
+        if isinstance(addr, bytes):
+            hexbytes = addr.hex() if len(addr) == 20 else addr.rjust(20, b"\x00").hex()
+            return Address("0x" + hexbytes)
+        if isinstance(addr, int):
+            return Address("0x" + format(addr, "040x"))
+        if isinstance(addr, str) and addr.startswith("0x"):
+            return Address(addr)
+        raise gl.vm.UserError("invalid address")
 
     def _only_owner(self):
         if gl.message.sender_address != self.owner:
@@ -124,7 +134,7 @@ class TravelAgent(gl.Contract):
         indefinitely.
         """
         self._only_owner()
-        self.provider_address = address
+        self.provider_address = self._normalize_address(address)
 
     @gl.public.write
     def set_provider_auth(self, token: str) -> None:

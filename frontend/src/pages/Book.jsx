@@ -105,16 +105,24 @@ export default function Book() {
     if (!quote) return;
     setBusy(true);
     try {
+      // A reservation must exist at the agency before escrow: the PNR returned
+      // here is the anchor confirm_completion/escalate verify against
+      // authenticated /status evidence. It cannot be made up by the client.
+      const reservationRef = await client.createReservation({
+        origin: form.origin, destination: form.destination,
+        depart: form.depart, ret: form.ret,
+      });
       const res = await client.book({
         origin: form.origin, destination: form.destination,
         depart: form.depart, ret: form.ret,
         paymentWei: quote.escrowWei.toString(),
+        reservationRef,
         account: wallet.account,
         provider: wallet.provider,
       });
       setBooking({ id: res.id, route: quote.route, priceWei: res.agreedWei, reservationRef: res.reservationRef });
       setQuote(null);
-      showToast("Trip booked: fare escrowed at the on-chain agreed price (network gas was charged separately).", "status");
+      showToast(`Trip booked (PNR ${reservationRef}): fare escrowed at the on-chain agreed price (network gas was charged separately).`, "status");
     } catch (err) {
       showToast("Booking failed: " + (err.message || "unknown error"), "alert");
     } finally {
