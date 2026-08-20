@@ -444,6 +444,27 @@ export class TravityClient {
     return true;
   }
 
+  /** Forces the contract to re-fetch and re-agree a live price for a
+   * route+dates (public write, but owner panel only). Use after the feed or
+   * price source changed so a stale on-chain agreement (e.g. one agreed at an
+   * outdated GEN/USD rate) is overwritten instead of continuing to drive the
+   * escrow the frontend pays. Returns the newly agreed price in wei. */
+  async refreshQuote(origin, destination, depart, ret, account, provider) {
+    const o = String(origin || "").toUpperCase();
+    const d = String(destination || "").toUpperCase();
+    const dep = Number(depart), r = Number(ret);
+    if (!isValidRoute(o, d)) throw new Error("Route must be two distinct 3-letter IATA codes.");
+    if (!isValidDates(dep, r)) throw new Error("Return date must be after departure date and both must be YYYYMMDD.");
+    const client = await this.writeClient(account, provider);
+    await runWrite(client, {
+      functionName: "refresh_quote",
+      args: [o, d, dep, r],
+      value: 0n,
+    });
+    const agreed = await this.agreedQuote(o, d, dep, r);
+    return agreed ? agreed.priceWei : null;
+  }
+
   async confirmCompletion(bookingId, account, provider) {
     const client = await this.writeClient(account, provider);
     await runWrite(client, { functionName: "confirm_completion", args: [bookingId], value: 0n });

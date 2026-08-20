@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { client } from "../lib/genlayer";
+import { client, fmtGen } from "../lib/genlayer";
 import { useWallet } from "../hooks/useWallet";
 
 const OWNER = String(import.meta.env.VITE_GENLAYER_OWNER_ADDRESS || "").trim();
@@ -42,6 +42,10 @@ export function OwnerFeedPanel() {
   const [providerToken, setProviderToken] = useState("");
   const [providerBusy, setProviderBusy] = useState(false);
   const [providerDone, setProviderDone] = useState({ addr: false, token: false });
+
+  const [reagree, setReagree] = useState({ origin: "", destination: "", depart: "", ret: "" });
+  const [reagreeBusy, setReagreeBusy] = useState(false);
+  const [reagreeAgreed, setReagreeAgreed] = useState(null);
 
   if (!OWNER || !client.live || !isOwner) return null;
 
@@ -88,6 +92,34 @@ export function OwnerFeedPanel() {
       showToast(err instanceof Error ? err.message : "Could not set provider auth token.", "alert");
     } finally {
       setProviderBusy(false);
+    }
+  }
+
+  const reagreeInputsValid =
+    /^[A-Za-z]{3}$/.test(reagree.origin.trim()) &&
+    /^[A-Za-z]{3}$/.test(reagree.destination.trim()) &&
+    /^\d{8}$/.test(String(reagree.depart).trim()) &&
+    /^\d{8}$/.test(String(reagree.ret).trim());
+
+  async function reAgreePrice() {
+    if (!reagreeInputsValid) return;
+    setReagreeBusy(true);
+    setReagreeAgreed(null);
+    try {
+      const priceWei = await client.refreshQuote(
+        reagree.origin, reagree.destination,
+        reagree.depart, reagree.ret,
+        wallet.account, wallet.provider
+      );
+      setReagreeAgreed(priceWei);
+      showToast(
+        priceWei ? `Price re-agreed: ${fmtGen(priceWei)}` : "Price re-agreed (read it back via a quote to confirm).",
+        "status"
+      );
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "Could not re-agree price.", "alert");
+    } finally {
+      setReagreeBusy(false);
     }
   }
 
@@ -181,6 +213,49 @@ export function OwnerFeedPanel() {
           >
             {providerBusy ? "Setting…" : providerDone.token ? "Auth token set ✓" : "Set auth token"}
           </button>
+        </div>
+
+        <div className="panel" style={{ marginTop: 24 }}>
+          <h2 id="owner-reagree-heading">Owner · Re-agree price</h2>
+          <p style={{ margin: "12px 0", color: "var(--ink-soft)" }}>
+            Forces <span className="mono">refresh_quote</span> to re-fetch and re-agree a live price for a
+            route + dates. Use after the feed URL or the server's GEN/USD rate changed: the frontend
+            otherwise pays the <em>old on-chain agreed price</em> (a stale inflated agreement keeps
+            driving the escrow). This overwrites it with a fresh agreed price.
+          </p>
+          <div className="form-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div className="form-field">
+              <label htmlFor="rag-from">From (IATA)</label>
+              <input id="rag-from" className="mono" value={reagree.origin} onChange={(e) => setReagree((s) => ({ ...s, origin: e.target.value }))} placeholder="JFK" autoComplete="off" />
+            </div>
+            <div className="form-field">
+              <label htmlFor="rag-to">To (IATA)</label>
+              <input id="rag-to" className="mono" value={reagree.destination} onChange={(e) => setReagree((s) => ({ ...s, destination: e.target.value }))} placeholder="LHR" autoComplete="off" />
+            </div>
+            <div className="form-field">
+              <label htmlFor="rag-depart">Departure (YYYYMMDD)</label>
+              <input id="rag-depart" className="mono" inputMode="numeric" value={reagree.depart} onChange={(e) => setReagree((s) => ({ ...s, depart: e.target.value }))} placeholder="20260901" />
+            </div>
+            <div className="form-field">
+              <label htmlFor="rag-ret">Return (YYYYMMDD)</label>
+              <input id="rag-ret" className="mono" inputMode="numeric" value={reagree.ret} onChange={(e) => setReagree((s) => ({ ...s, ret: e.target.value }))} placeholder="20260908" />
+            </div>
+          </div>
+          <button
+            type="button"
+            className="btn btn-accent"
+            onClick={reAgreePrice}
+            disabled={reagreeBusy || !reagreeInputsValid}
+            title="Call refresh_quote"
+            style={{ marginTop: 12 }}
+          >
+            {reagreeBusy ? "Re-agreeing…" : "Re-agree price on-chain"}
+          </button>
+          {reagreeAgreed != null && (
+            <p className="mono" style={{ marginTop: 8, color: "var(--ink-soft)" }}>
+              new agreed price: {fmtGen(reagreeAgreed)}
+            </p>
+          )}
         </div>
       </div>
       {toast && (
