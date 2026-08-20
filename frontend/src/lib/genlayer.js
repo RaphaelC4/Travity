@@ -81,6 +81,7 @@ const loadBookings = () => {
       priceWei: BigInt(b.priceWei ?? 0n),
       status: String(b.status || "confirmed"),
       completion: Boolean(b.completion),
+      reservationRef: b.reservationRef ? String(b.reservationRef) : "",
     }));
   } catch {
     return [];
@@ -128,6 +129,25 @@ const isValidRoute = (o, d) =>
 const isValidDates = (depart, ret) =>
   Number.isInteger(Number(depart)) && Number.isInteger(Number(ret)) &&
   Number(depart) < Number(ret);
+
+// Mirrors the contract's _valid_ref: 4-128 chars once trimmed.
+const isValidRef = (ref) =>
+  typeof ref === "string" && ref.trim().length >= 4 && ref.trim().length <= 128;
+
+/** Client-side placeholder reservation reference, used until a real provider
+ * booking API is wired in. The contract only format-checks this at book()
+ * time — it's actually verified later against authenticated provider
+ * evidence in confirm_completion/escalate, so a placeholder here is honest
+ * (it doesn't claim to be a real PNR) as long as the owner's feed_base +
+ * provider_auth_token are pointed at something that can resolve it. Swap
+ * this out for the real confirmation code once the server creates an actual
+ * reservation with a carrier/agency before escrow. */
+const generateReservationRef = (origin, destination) => {
+  const rand = (typeof crypto !== "undefined" && crypto.randomUUID)
+    ? crypto.randomUUID().slice(0, 8)
+    : Math.random().toString(16).slice(2, 10);
+  return `TRV-${origin}${destination}-${Date.now()}-${rand}`.toUpperCase();
+};
 
 // ---- live helpers (genlayer-js) ---------------------------------------------
 
@@ -248,13 +268,17 @@ export class TravityClient {
     };
   }
 
-  async book({ origin, destination, depart, ret, paymentWei, account, provider }) {
+  async book({ origin, destination, depart, ret, paymentWei, reservationRef, account, provider }) {
     const o = origin.toUpperCase(), d = destination.toUpperCase();
     const dep = Number(depart), r = Number(ret);
     if (!isValidRoute(o, d)) throw new Error("Invalid route.");
     if (!isValidDates(dep, r)) throw new Error("Return date must be after departure date.");
     const priceWei = BigInt(paymentWei ?? 0n);
     if (priceWei <= 0n) throw new Error("Payment must be greater than zero.");
+    // reservation_ref anchors this escrow to a real reservation; the contract
+    // rejects book() without one. Callers can pass their own (a real PNR from
+    // a provider booking API) or let one be generated as a placeholder.
+    const ref = isValidRef(reservationRef) ? reservationRef.trim() : generateReservationRef(o, d);
 
     // Cached on-chain agreement for these exact dates. When present we skip the
     // refresh_quote write entirely: repeat bookings drop to a single write per
@@ -296,7 +320,7 @@ export class TravityClient {
     const client = await this.writeClient(account, provider);
     await runWrite(client, {
       functionName: "book",
-      args: [o, d, dep, r],
+      args: [o, d, dep, r, ref],
       value: bookValue,
     });
     // The contract stores bookings under `_quote_key + "-" + str(sender)`
@@ -308,9 +332,10 @@ export class TravityClient {
     sessionBookings.push({
       id, route: `${o}-${d}`, depart: dep, ret: r,
       priceWei: bookValue, status: "confirmed", completion: false, onChainId,
+      reservationRef: ref,
     });
     persistBookings(sessionBookings);
-    return { id, onChainId, agreedWei: bookValue };
+    return { id, onChainId, agreedWei: bookValue, reservationRef: ref };
   }
 
   /** Rebuilds the contract's booking_id for (route, dates, sender) and confirms
@@ -356,6 +381,37 @@ export class TravityClient {
     const client = await this.writeClient(account, provider);
     await runWrite(client, { functionName: "set_feed_url", args: [clean], value: 0n });
     return clean;
+  }
+
+  /** Owner-only (set_provider). The carrier/agency settlement payout
+   * address — receives the escrowed fare on verified completion, or the
+   * non-refunded remainder after a dispute ruling. Reverts with
+   * `only owner` if the connected wallet is not the contract owner. */
+  async setProvider(address, account, provider) {
+    const clean = String(address || "").trim();
+    if (!/^0x[0-9a-fA-F]{40}$/.test(clean)) {
+      throw new Error("Provider address must be a 0x-prefixed 20-byte address.");
+    }
+    const client = await this.writeClient(account, provider);
+    await runWrite(client, { functionName: "set_provider", args: [clean], value: 0n });
+    return clean;
+  }
+
+  /** Owner-only (set_provider_auth). Bearer token sent on every
+   * confirm_completion/escalate provider read so evidence is authenticated,
+   * not a public/spoofable fetch. NOTE: this is stored on-chain in
+   * plaintext (see docs/security.md) — treat it as a low-privilege,
+   * rotatable, status-read-only token, never a secret you couldn't afford
+   * to have public. Never put this in a VITE_ env var: anything with that
+   * prefix is bundled into the public JS at build time. */
+  async setProviderAuth(token, account, provider) {
+    const clean = String(token || "").trim();
+    if (clean.length < 8) {
+      throw new Error("Provider auth token must be at least 8 characters.");
+    }
+    const client = await this.writeClient(account, provider);
+    await runWrite(client, { functionName: "set_provider_auth", args: [clean], value: 0n });
+    return true;
   }
 
   async confirmCompletion(bookingId, account, provider) {
