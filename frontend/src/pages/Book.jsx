@@ -112,7 +112,7 @@ export default function Book() {
         account: wallet.account,
         provider: wallet.provider,
       });
-      setBooking({ id: res.id, route: quote.route, priceWei: res.agreedWei });
+      setBooking({ id: res.id, route: quote.route, priceWei: res.agreedWei, reservationRef: res.reservationRef });
       setQuote(null);
       showToast("Trip booked: fare escrowed at the on-chain agreed price (network gas was charged separately).", "status");
     } catch (err) {
@@ -234,6 +234,9 @@ export default function Book() {
             {booking && (
               <div role="status" style={{ marginTop: 16 }}>
                 <div className="list-line"><span className="k">Booking</span><span className="v mono">{booking.id}</span></div>
+                {booking.reservationRef && (
+                  <div className="list-line"><span className="k">Reservation ref</span><span className="v mono">{booking.reservationRef}</span></div>
+                )}
                 <div className="list-line"><span className="k">Status</span><span className="v"><span className="pill pill-accepted">CONFIRMED</span></span></div>
                 {!booking.done ? (
                   needsWallet ? (
