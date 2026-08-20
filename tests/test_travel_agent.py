@@ -49,13 +49,16 @@ class TreeMap(_TreeMap):
 
 class _Proxy:
     """Stand-in for an @gl.evm.contract_interface proxy: accepts an address
-    and exposes emit_transfer as a no-op so escalate() can run locally."""
+    and records emit_transfer calls (address, value) so settlement payouts
+    can be asserted on instead of just "it didn't crash"."""
+
+    calls = []
 
     def __init__(self, address):
         self.address = address
 
     def emit_transfer(self, value=0, **k):
-        pass
+        _Proxy.calls.append((self.address, int(value)))
 
 
 def _decora(f=None, **k):
@@ -90,7 +93,7 @@ def _install_gl_mock():
         ),
         evm=types.SimpleNamespace(contract_interface=lambda c: _Proxy),
         nondet=types.SimpleNamespace(
-            web=types.SimpleNamespace(get=lambda url: _FakeResponse("200")),
+            web=types.SimpleNamespace(get=lambda url, headers=None: _FakeResponse("200")),
             exec_prompt=lambda p: "100",
         ),
         vm=types.SimpleNamespace(
@@ -110,9 +113,9 @@ def _install_gl_mock():
 
 
 class _FakeResponse:
-    def __init__(self, text):
+    def __init__(self, text, status_code=200):
         self.body = text.encode("utf-8")
-        self.status_code = 200
+        self.status_code = status_code
 
 
 _install_gl_mock()
@@ -137,6 +140,11 @@ def agent():
     c.paused = False
     c.killed = False
     c.feed_base = "https://example.co"
+    # provider settlement + auth must be configured for confirm_completion /
+    # escalate to run at all — mirrors the owner setup a real deployment does
+    c.provider_address = "0xPROVIDER"
+    c.provider_auth_token = "test-provider-token"
+    _Proxy.calls = []
     return c
 
 
@@ -205,7 +213,7 @@ class TestBooking:
     def test_escrow_accepts_exact_price(self, agent, monkeypatch):
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
         monkeypatch.setattr("genlayer.gl.message.value", 500_000)
-        bid = agent.book("JFK", "LHR", 20261001, 20261010)
+        bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
         booking = json.loads(agent.bookings[bid])
         assert booking["status"] == "confirmed"
         assert booking["price_wei"] == 500_000
@@ -213,40 +221,54 @@ class TestBooking:
     def test_overpayment_credited_to_loyalty(self, agent, monkeypatch):
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
         monkeypatch.setattr("genlayer.gl.message.value", 600_000)
-        agent.book("JFK", "LHR", 20261001, 20261010)
+        agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
         assert agent.loyalty["0xALICE"] == 100_000
 
     def test_underpayment_reverts(self, agent, monkeypatch):
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
         monkeypatch.setattr("genlayer.gl.message.value", 100_000)
         with pytest.raises(RuntimeError):
-            agent.book("JFK", "LHR", 20261001, 20261010)
+            agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
 
     def test_grief_large_payment_reverts(self, agent, monkeypatch):
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
         monkeypatch.setattr("genlayer.gl.message.value", 2_000_000)
         with pytest.raises(RuntimeError):
-            agent.book("JFK", "LHR", 20261001, 20261010)
+            agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
 
     def test_duplicate_booking_reverts(self, agent, monkeypatch):
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
         monkeypatch.setattr("genlayer.gl.message.value", 500_000)
-        agent.book("JFK", "LHR", 20261001, 20261010)
+        agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
         with pytest.raises(RuntimeError):
-            agent.book("JFK", "LHR", 20261001, 20261010)
+            agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
+
+    def test_invalid_reservation_ref_reverts(self, agent, monkeypatch):
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
+        monkeypatch.setattr("genlayer.gl.message.value", 500_000)
+        with pytest.raises(RuntimeError):
+            agent.book("JFK", "LHR", 20261001, 20261010, "")
+        with pytest.raises(RuntimeError):
+            agent.book("JFK", "LHR", 20261001, 20261010, "ab")
+
+    def test_reservation_ref_stored_on_booking(self, agent, monkeypatch):
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
+        monkeypatch.setattr("genlayer.gl.message.value", 500_000)
+        bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
+        assert json.loads(agent.bookings[bid])["reservation_ref"] == "PNR-ABC123"
 
     def test_invalid_dates_revert(self, agent, monkeypatch):
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
         monkeypatch.setattr("genlayer.gl.message.value", 500_000)
         with pytest.raises(RuntimeError):
-            agent.book("JFK", "LHR", 20261010, 20261001)  # return before depart
+            agent.book("JFK", "LHR", 20261010, 20261001, "PNR-ABC123")  # return before depart
 
 
 class TestLoyalty:
     def test_mint_on_verified_completion(self, agent, monkeypatch):
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
         monkeypatch.setattr("genlayer.gl.message.value", 500_000)
-        bid = agent.book("JFK", "LHR", 20261001, 20261010)
+        bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
 
         # owner must be the caller for minting
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")
@@ -255,11 +277,49 @@ class TestLoyalty:
         agent.confirm_completion(bid)
         # loyalty mints to the CUSTOMER who booked, not the caller
         assert agent.loyalty["0xALICE"] == LOYALTY_PER_BOOKING
+        # the escrowed fare settles to the provider, exactly once
+        assert _Proxy.calls == [("0xPROVIDER", 500_000)]
+        assert json.loads(agent.bookings[bid])["settled"] is True
+
+    def test_confirm_completion_requires_provider_configured(self, agent, monkeypatch):
+        agent.provider_address = ADMIN_ZERO
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
+        monkeypatch.setattr("genlayer.gl.message.value", 500_000)
+        bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
+
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")
+        with pytest.raises(RuntimeError, match="set_provider"):
+            agent.confirm_completion(bid)
+
+    def test_confirm_completion_requires_provider_auth(self, agent, monkeypatch):
+        agent.provider_auth_token = ""
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
+        monkeypatch.setattr("genlayer.gl.message.value", 500_000)
+        bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
+
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")
+        with pytest.raises(RuntimeError, match="set_provider_auth"):
+            agent.confirm_completion(bid)
+
+    def test_confirm_completion_rejects_unauthenticated_evidence(self, agent, monkeypatch):
+        """A 401/expired-auth response must never read as 'trip completed'."""
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
+        monkeypatch.setattr("genlayer.gl.message.value", 500_000)
+        bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
+
+        monkeypatch.setattr(
+            "genlayer.gl.nondet.web.get",
+            lambda url, headers=None: _FakeResponse("401", status_code=401),
+        )
+        monkeypatch.setattr("genlayer.gl.nondet.exec_prompt", lambda p: "yes")  # even if the LLM would say yes
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")
+        with pytest.raises(RuntimeError):
+            agent.confirm_completion(bid)
 
     def test_non_owner_cannot_confirm(self, agent, monkeypatch):
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
         monkeypatch.setattr("genlayer.gl.message.value", 500_000)
-        bid = agent.book("JFK", "LHR", 20261001, 20261010)
+        bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
 
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xINTRUDER")
         with pytest.raises(RuntimeError):
@@ -267,18 +327,21 @@ class TestLoyalty:
 
 
 class TestDispute:
-    def _book(self, agent):
+    def _book(self, agent, customer="0xALICE"):
         agent.quotes["JFK-LHR-20261001-20261010"] = u256(500_000)
-        bid = "JFK-LHR-20261001-20261010-0xALICE"
+        bid = "JFK-LHR-20261001-20261010-" + customer
         agent.bookings[bid] = json.dumps({
             "route": "JFK-LHR",
-            "customer": "0xALICE",
+            "customer": customer,
             "depart": 20261001,
             "ret": 20261010,
+            "reservation_ref": "PNR-ABC123",
             "price_wei": 500_000,
             "paid_wei": 500_000,
             "status": "confirmed",
-            "completion_verified": True,
+            "completion_verified": False,
+            "settled": False,
+            "settled_wei": 0,
         })
         return bid
 
@@ -287,30 +350,70 @@ class TestDispute:
         with pytest.raises(RuntimeError):
             agent.file_dispute("NOPE-0xALICE-1", "delay beyond policy window")
 
+    def test_file_dispute_requires_customer(self, agent, monkeypatch):
+        """Only the customer who made the booking may dispute it."""
+        bid = self._book(agent, customer="0xALICE")
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xNOTALICE")
+        with pytest.raises(RuntimeError, match="only the booking customer"):
+            agent.file_dispute(bid, "delay beyond policy window")
+
     def test_file_dispute_rejects_short_reason(self, agent, monkeypatch):
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
         bid = self._book(agent)
         with pytest.raises(RuntimeError):
             agent.file_dispute(bid, "bad")
 
+    def test_file_dispute_blocked_once_settled(self, agent, monkeypatch):
+        """A completed-and-settled booking has no escrow left to split."""
+        bid = self._book(agent)
+        agent.bookings[bid] = json.dumps({
+            **json.loads(agent.bookings[bid]),
+            "status": "completed",
+            "settled": True,
+            "settled_wei": 500_000,
+        })
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
+        with pytest.raises(RuntimeError):
+            agent.file_dispute(bid, "delay beyond policy window")
+
     def test_dispute_escalation_produces_ruling_within_cap(self, agent, monkeypatch):
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
         bid = self._book(agent)
-        import genlayer
-        genlayer.gl.nondet.exec_prompt = lambda p: "50000"
+        monkeypatch.setattr("genlayer.gl.nondet.exec_prompt", lambda p: "50000")
         dispute_id = agent.file_dispute(bid, "delay beyond policy window")
         refund = agent.escalate(dispute_id, u256(0))
         assert 0 <= refund <= 500_000
         assert json.loads(agent.disputes[dispute_id])["status"] == "ruled"
+        # refund goes to the claimant, remainder settles to the provider —
+        # both legs paid, nothing left unaccounted for
+        assert _Proxy.calls == [("0xALICE", 50_000), ("0xPROVIDER", 450_000)]
+        assert json.loads(agent.bookings[bid])["settled"] is True
 
     def test_ruling_capped_at_booking_price(self, agent, monkeypatch):
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
         bid = self._book(agent)
-        import genlayer
-        genlayer.gl.nondet.exec_prompt = lambda p: "9999999999"
+        monkeypatch.setattr("genlayer.gl.nondet.exec_prompt", lambda p: "9999999999")
         dispute_id = agent.file_dispute(bid, "delay beyond policy window")
         refund = agent.escalate(dispute_id, u256(0))
         assert refund <= 500_000
+
+    def test_escalate_cannot_be_replayed(self, agent, monkeypatch):
+        """Even a zero-refund ruling must block a second settlement call."""
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
+        bid = self._book(agent)
+        monkeypatch.setattr("genlayer.gl.nondet.exec_prompt", lambda p: "0")
+        dispute_id = agent.file_dispute(bid, "delay beyond policy window")
+        agent.escalate(dispute_id, u256(0))
+        with pytest.raises(RuntimeError, match="already settled"):
+            agent.escalate(dispute_id, u256(0))
+
+    def test_escalate_requires_provider_configured(self, agent, monkeypatch):
+        agent.provider_address = ADMIN_ZERO
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
+        bid = self._book(agent)
+        dispute_id = agent.file_dispute(bid, "delay beyond policy window")
+        with pytest.raises(RuntimeError, match="set_provider"):
+            agent.escalate(dispute_id, u256(0))
 
 
 class TestGuard:
@@ -320,7 +423,7 @@ class TestGuard:
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
         monkeypatch.setattr("genlayer.gl.message.value", 500_000)
         with pytest.raises(RuntimeError):
-            agent.book("JFK", "LHR", 20261001, 20261010)
+            agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
 
     def test_only_owner_can_kill(self, agent, monkeypatch):
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
