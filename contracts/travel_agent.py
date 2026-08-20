@@ -50,6 +50,8 @@ class TravelAgent(gl.Contract):
     disputes: TreeMap[str, str]        # dispute_id -> JSON string
     last_dispute_time: TreeMap[Address, u256]
     feed_base: str                     # provider feed root; owner-adjustable
+    provider_address: Address          # carrier/agency settlement payout address
+    provider_auth_token: str           # bearer token for authenticated provider reads
 
     def __init__(self, owner: Address):
         # GenVM decodes constructor address args from the raw 20-byte calldata
@@ -71,6 +73,8 @@ class TravelAgent(gl.Contract):
         # TreeMap() doesn't carry the same specialized type as the declared
         # TreeMap[K, V] field. Leaving them untouched keeps them at {}.
         self.feed_base = "https://api.example-travel-provider.com"
+        self.provider_address = ADMIN_ZERO
+        self.provider_auth_token = ""
 
     # -- Admin ---------------------------------------------------------------
 
@@ -110,6 +114,31 @@ class TravelAgent(gl.Contract):
             raise gl.vm.UserError("feed url must be an https URL")
         self.feed_base = url.rstrip("/")
 
+    @gl.public.write
+    def set_provider(self, address: Address) -> None:
+        """Owner-only: the carrier/agency settlement payout address.
+
+        Receives the escrowed fare once a completion is verified, or the
+        non-refunded remainder once a dispute is ruled. This is what makes
+        settlement a defined path instead of funds sitting in the contract
+        indefinitely.
+        """
+        self._only_owner()
+        self.provider_address = address
+
+    @gl.public.write
+    def set_provider_auth(self, token: str) -> None:
+        """Owner-only: bearer token attached to provider status reads.
+
+        Without this, `confirm_completion`/`escalate` would treat an
+        unauthenticated, spoofable page fetch as evidence. The token ties
+        the read to a real, authenticated carrier/agency session.
+        """
+        self._only_owner()
+        if not isinstance(token, str) or len(token.strip()) < 8:
+            raise gl.vm.UserError("provider auth token too short")
+        self.provider_auth_token = token.strip()
+
     # -- Helpers -------------------------------------------------------------
 
     def _valid_route(self, origin: str, destination: str) -> bool:
@@ -126,6 +155,17 @@ class TravelAgent(gl.Contract):
         if depart >= ret:
             return False
         return True
+
+    def _valid_ref(self, ref: str) -> bool:
+        """A reservation_ref ties the on-chain escrow to a real, off-chain
+        reservation (e.g. the PNR/confirmation code the provider issued when
+        the reservation was created). Format-check only; the reference is
+        actually verified against provider evidence at completion/dispute
+        time, not trusted at face value here."""
+        if not isinstance(ref, str):
+            return False
+        r = ref.strip()
+        return 4 <= len(r) <= 128
 
     def _current_time(self) -> u256:
         # GenVM exposes no block number/height — confirmed by docs
@@ -221,18 +261,30 @@ class TravelAgent(gl.Contract):
     # -- Booking -------------------------------------------------------------
 
     @gl.public.write.payable
-    def book(self, origin: str, destination: str, depart: int, ret: int) -> str:
+    def book(self, origin: str, destination: str, depart: int, ret: int, reservation_ref: str) -> str:
         """Escrow GEN for a booking.
 
         The caller must send at least the last agreed quote price in wei.
         Overpayment is credited to loyalty; underpayment reverts;
         amounts far above the quote (grief/dust attempts) revert.
+
+        `reservation_ref` is the PNR/confirmation code the carrier or agency
+        issued when the reservation was actually created off-chain (the
+        server creates the reservation via the provider's booking API before
+        the customer escrows funds, and passes the resulting reference
+        through here). It's only format-checked at booking time — it's the
+        anchor that `confirm_completion`/`escalate` later verify against
+        authenticated provider evidence, so a caller can't just make one up
+        and have it accepted as proof of anything.
         """
         self._unpaused()
         if not self._valid_route(origin, destination):
             raise gl.vm.UserError("invalid route")
         if not self._valid_dates(depart, ret):
             raise gl.vm.UserError("invalid dates")
+        if not self._valid_ref(reservation_ref):
+            raise gl.vm.UserError("invalid reservation reference")
+        ref = reservation_ref.strip()
 
         key = self._quote_key(origin, destination, depart, ret)
         price = self.quotes.get(key)
@@ -256,10 +308,13 @@ class TravelAgent(gl.Contract):
             "customer": str(sender),
             "depart": depart,
             "ret": ret,
+            "reservation_ref": ref,
             "price_wei": int(price),
             "paid_wei": int(sent),
             "status": "confirmed",
             "completion_verified": False,
+            "settled": False,
+            "settled_wei": 0,
         }
         self.bookings[booking_id] = json.dumps(record)
         if over > u256(0):
@@ -268,12 +323,17 @@ class TravelAgent(gl.Contract):
 
     @gl.public.write
     def confirm_completion(self, booking_id: str) -> None:
-        """Verify a trip completed via live web data, then mint loyalty
-        to the CUSTOMER who made the booking (not the caller).
+        """Verify a trip completed using AUTHENTICATED carrier/agency
+        evidence tied to this booking's own reservation, settle the
+        escrowed fare to the provider, then mint loyalty to the CUSTOMER
+        who made the booking (not the caller).
 
         Verification runs inside a prompt_non_comparative consensus block,
-        so validators check the provider independently and a booking cannot
-        be self-confirmed. Owner-gated since it issues value-bearing loyalty.
+        so validators independently query the provider (with the owner-set
+        bearer token) and independently confirm the response references this
+        booking's reservation_ref — a generic page or an unauthenticated
+        "yes" is not accepted as evidence. Owner-gated since it issues
+        value-bearing loyalty and moves escrowed funds.
         """
         self._only_owner()
         raw = self.bookings.get(booking_id)
@@ -282,17 +342,33 @@ class TravelAgent(gl.Contract):
         booking = json.loads(raw)
         if booking["status"] != "confirmed" or booking["completion_verified"]:
             raise gl.vm.UserError("booking not verifiable")
+        ref = booking.get("reservation_ref", "")
+        if not ref:
+            raise gl.vm.UserError("booking has no reservation reference on file")
+        if not self.provider_auth_token:
+            raise gl.vm.UserError("provider authentication not configured: owner must call set_provider_auth")
+        if self.provider_address == ADMIN_ZERO:
+            raise gl.vm.UserError("provider payout address not configured: owner must call set_provider")
 
         feed = self.feed_base
+        token = self.provider_auth_token
 
         def get_status() -> str:
             res = gl.nondet.web.get(
-                feed + "/status?ref=" + booking_id
+                feed + "/status?ref=" + ref,
+                headers={"Authorization": "Bearer " + token},
             )
+            if res.status_code != 200:
+                # auth failure or provider error is not evidence of anything
+                return "no"
             page = res.body.decode("utf-8")
             ok = gl.nondet.exec_prompt(
-                "Did this trip complete without full cancellation? "
-                "Answer only yes or no. " + page[:4000]
+                "This is an authenticated carrier/agency status read for "
+                "reservation " + ref + ". Reply only 'yes' or 'no': does this "
+                "evidence confirm reservation " + ref + " exists and "
+                "completed without full cancellation? Reply 'no' if the "
+                "reservation reference is not present in the evidence. "
+                + page[:4000]
             )
             return ok.strip().lower()
 
@@ -303,14 +379,26 @@ class TravelAgent(gl.Contract):
         # than prompt_comparative.
         verdict = gl.eq_principle.prompt_non_comparative(
             get_status,
-            task="Answer only 'yes' or 'no': did this trip complete without full cancellation?",
-            criteria="Response must be a clear yes/no-style answer about trip completion.",
+            task="Answer only 'yes' or 'no': does the authenticated evidence "
+                 "confirm reservation " + ref + " completed without full cancellation?",
+            criteria="Response must be a clear yes/no-style answer, and must be "
+                      "'no' unless the reservation reference is present in the evidence.",
         )
         if str(verdict).lower() not in ("yes", "true", "1", "done", "completed"):
             raise gl.vm.UserError("trip completion not verified")
 
         booking["status"] = "completed"
         booking["completion_verified"] = True
+
+        # Settlement path: the escrowed fare goes to the carrier/agency now
+        # that verified, authenticated completion evidence exists. Guarded
+        # so a booking is never settled twice.
+        if not booking.get("settled"):
+            price = u256(booking["price_wei"])
+            _Payee(self.provider_address).emit_transfer(value=price)
+            booking["settled"] = True
+            booking["settled_wei"] = int(price)
+
         self.bookings[booking_id] = json.dumps(booking)
 
         customer = Address(booking["customer"])
@@ -332,8 +420,16 @@ class TravelAgent(gl.Contract):
         if raw is None:
             raise gl.vm.UserError("unknown booking")
         booking = json.loads(raw)
-        if booking["status"] == "disputed":
-            raise gl.vm.UserError("already disputed")
+        if str(sender) != booking["customer"]:
+            raise gl.vm.UserError("only the booking customer may file a dispute")
+        if booking["status"] != "confirmed":
+            # Once a booking is "completed" it has already been settled in
+            # full to the provider (confirm_completion), and "disputed" /
+            # "resolved" bookings have already gone through escalate()'s
+            # settlement. There is no escrow left to split once either
+            # settlement path has run, so a dispute can only be opened
+            # against a still-escrowed, unsettled booking.
+            raise gl.vm.UserError("booking is not open to dispute (already completed, disputed, or resolved)")
         if not isinstance(reason, str) or len(reason) < 10 or len(reason) > 500:
             raise gl.vm.UserError("invalid dispute reason")
 
@@ -357,25 +453,37 @@ class TravelAgent(gl.Contract):
 
     @gl.public.write
     def escalate(self, dispute_id: str, refund_floor_hint: u256) -> u256:
-        """Produce the AI adjudication for a dispute and pay the refund out.
+        """Produce the AI adjudication for a dispute and settle BOTH legs:
+        the refund to the customer and the non-refunded remainder to the
+        carrier/agency.
 
-        Validators weigh the reason and live provider evidence via a
-        prompt_comparative consensus block, settle on a refund in wei capped at the
-        booking price, then the refund is transferred to the claimant.
-        refund_floor_hint is only a hint; consensus decides the number.
+        Validators weigh the dispute reason against AUTHENTICATED provider
+        evidence tied to the booking's own reservation_ref via a
+        prompt_comparative consensus block, settle on a refund in wei capped
+        at the booking price. The dispute["status"] == "ruled" guard below
+        is unconditional (not paid_out-dependent), so this cannot be replayed
+        even when the ruling is a zero refund. refund_floor_hint is only a
+        hint; consensus decides the number.
         """
         raw_dispute = self.disputes.get(dispute_id)
         if raw_dispute is None:
             raise gl.vm.UserError("unknown dispute")
         dispute = json.loads(raw_dispute)
+        if dispute["status"] == "ruled":
+            raise gl.vm.UserError("dispute already settled")
 
         raw_booking = self.bookings.get(dispute["booking_id"])
         if raw_booking is None:
             raise gl.vm.UserError("booking not found")
         booking = json.loads(raw_booking)
 
-        if dispute["status"] == "ruled" and dispute.get("paid_out"):
-            raise gl.vm.UserError("dispute already settled")
+        ref = booking.get("reservation_ref", "")
+        if not ref:
+            raise gl.vm.UserError("booking has no reservation reference on file")
+        if not self.provider_auth_token:
+            raise gl.vm.UserError("provider authentication not configured: owner must call set_provider_auth")
+        if self.provider_address == ADMIN_ZERO:
+            raise gl.vm.UserError("provider payout address not configured: owner must call set_provider")
 
         dispute["rounds"] = dispute["rounds"] + 1
         price_max = u256(booking["price_wei"])
@@ -384,20 +492,27 @@ class TravelAgent(gl.Contract):
         # Same nondet-storage rule as refresh_quote/confirm_completion: capture
         # the feed root before the closure instead of reading storage inside it.
         feed = self.feed_base
+        token = self.provider_auth_token
 
         def get_ruling() -> str:
             try:
                 res = gl.nondet.web.get(
-                    feed + "/status?ref=" + dispute["booking_id"]
+                    feed + "/status?ref=" + ref,
+                    headers={"Authorization": "Bearer " + token},
                 )
-                evidence = res.body.decode("utf-8")[:2000]
+                if res.status_code != 200:
+                    evidence = "provider evidence unavailable (auth/status error)"
+                else:
+                    evidence = res.body.decode("utf-8")[:2000]
             except Exception:
                 evidence = "provider status unavailable"
             return gl.nondet.exec_prompt(
-                "Travity travel dispute. Reason: " + reason +
+                "Travity travel dispute for reservation " + ref + ". Reason: " + reason +
                 ". Booking price (wei): " + str(price_max) +
-                ". Provider status: " + evidence +
-                ". Decide a fair refund in integer wei from 0 to " +
+                ". Authenticated provider evidence: " + evidence +
+                ". If the evidence does not reference reservation " + ref +
+                " or is unavailable, award the full booking price as refund. "
+                "Otherwise decide a fair refund in integer wei from 0 to " +
                 str(price_max) + ". Reply only with the number."
             )
 
@@ -415,8 +530,10 @@ class TravelAgent(gl.Contract):
 
         dispute["status"] = "ruled"
         dispute["refund_wei"] = int(refund)
-        self.disputes[dispute_id] = json.dumps(dispute)
 
+        # -- Settlement: the customer's refund leg and the provider's
+        # remainder leg both happen here, once, guarded by the unconditional
+        # "already ruled" check above.
         if refund > u256(0):
             claimant = Address(dispute["claimant"])
             # Confirmed against docs.genlayer.com/.../features/value-transfers:
@@ -425,7 +542,16 @@ class TravelAgent(gl.Contract):
             # There is no bare gl.emit_transfer() — that was an unverified guess.
             _Payee(claimant).emit_transfer(value=refund)
             dispute["paid_out"] = True
-            self.disputes[dispute_id] = json.dumps(dispute)
+
+        remainder = price_max - refund
+        if remainder > u256(0):
+            _Payee(self.provider_address).emit_transfer(value=remainder)
+
+        booking["settled"] = True
+        booking["settled_wei"] = int(remainder)
+        booking["status"] = "resolved"
+        self.bookings[dispute["booking_id"]] = json.dumps(booking)
+        self.disputes[dispute_id] = json.dumps(dispute)
 
         return refund
 
