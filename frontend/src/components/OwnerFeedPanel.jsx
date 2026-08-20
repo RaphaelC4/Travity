@@ -31,6 +31,18 @@ export function OwnerFeedPanel() {
   const [done, setDone] = useState(false);
 
   const isOwner = wallet.status === "connected" && wallet.account?.toLowerCase() === OWNER.toLowerCase();
+
+  // Provider settlement address + auth token: typed in at runtime, never
+  // baked into the build. An address isn't secret, but the token would be
+  // bundled into the public JS if it ever went through import.meta.env —
+  // both live in local component state only, entered by the owner per
+  // session. This must stay below the OWNER/isOwner check for hooks order,
+  // but the check itself happens after, same as the feed panel below.
+  const [providerAddr, setProviderAddr] = useState("");
+  const [providerToken, setProviderToken] = useState("");
+  const [providerBusy, setProviderBusy] = useState(false);
+  const [providerDone, setProviderDone] = useState({ addr: false, token: false });
+
   if (!OWNER || !client.live || !isOwner) return null;
 
   const block = hardBlock();
@@ -49,6 +61,33 @@ export function OwnerFeedPanel() {
       showToast(err instanceof Error ? err.message : "Could not set feed URL.", "alert");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function setProviderAddress() {
+    setProviderBusy(true);
+    try {
+      const pushed = await client.setProvider(providerAddr, wallet.account, wallet.provider);
+      setProviderDone((s) => ({ ...s, addr: true }));
+      showToast(`Settlement payout address set to ${pushed}`, "status");
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "Could not set provider address.", "alert");
+    } finally {
+      setProviderBusy(false);
+    }
+  }
+
+  async function setProviderAuthToken() {
+    setProviderBusy(true);
+    try {
+      await client.setProviderAuth(providerToken, wallet.account, wallet.provider);
+      setProviderDone((s) => ({ ...s, token: true }));
+      setProviderToken("");
+      showToast("Provider auth token set.", "status");
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "Could not set provider auth token.", "alert");
+    } finally {
+      setProviderBusy(false);
     }
   }
 
@@ -85,6 +124,63 @@ export function OwnerFeedPanel() {
             This calls owner-only <span className="mono">set_feed_url</span>. It does not change the server or
             redeploy the contract.
           </p>
+        </div>
+
+        <div className="panel" style={{ marginTop: 24 }}>
+          <h2 id="owner-provider-heading">Owner · Settlement &amp; authentication</h2>
+          <p style={{ margin: "12px 0", color: "var(--ink-soft)" }}>
+            <span className="mono">confirm_completion</span> and <span className="mono">escalate</span> both
+            refuse to run until these two are set. Neither is bundled from an env var — type them in below,
+            per session, so the auth token never ends up in the public JS build.
+          </p>
+
+          <div className="form-field" style={{ marginTop: 12 }}>
+            <label htmlFor="provider-addr">Settlement payout address (carrier/agency)</label>
+            <input
+              id="provider-addr"
+              className="mono"
+              value={providerAddr}
+              onChange={(e) => setProviderAddr(e.target.value)}
+              placeholder="0x…"
+              autoComplete="off"
+            />
+          </div>
+          <button
+            type="button"
+            className="btn btn-accent"
+            onClick={setProviderAddress}
+            disabled={providerBusy || !/^0x[0-9a-fA-F]{40}$/.test(providerAddr.trim())}
+            title="Call set_provider"
+            style={{ marginTop: 8 }}
+          >
+            {providerBusy ? "Setting…" : providerDone.addr ? "Payout address set ✓" : "Set payout address"}
+          </button>
+
+          <div className="form-field" style={{ marginTop: 20 }}>
+            <label htmlFor="provider-token">Provider bearer token</label>
+            <input
+              id="provider-token"
+              type="password"
+              value={providerToken}
+              onChange={(e) => setProviderToken(e.target.value)}
+              placeholder="min. 8 characters"
+              autoComplete="off"
+            />
+            <p className="hint" style={{ marginTop: 4 }}>
+              Stored on-chain in plaintext (see docs/security.md) — use a low-privilege, rotatable,
+              status-read-only token, never a token with write access on the provider's own API.
+            </p>
+          </div>
+          <button
+            type="button"
+            className="btn btn-accent"
+            onClick={setProviderAuthToken}
+            disabled={providerBusy || providerToken.trim().length < 8}
+            title="Call set_provider_auth"
+            style={{ marginTop: 8 }}
+          >
+            {providerBusy ? "Setting…" : providerDone.token ? "Auth token set ✓" : "Set auth token"}
+          </button>
         </div>
       </div>
       {toast && (
