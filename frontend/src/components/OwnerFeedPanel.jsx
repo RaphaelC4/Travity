@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { client } from "../lib/genlayer";
 import { useWallet } from "../hooks/useWallet";
-import { shortAddress } from "../lib/wallet";
 
 const OWNER = String(import.meta.env.VITE_GENLAYER_OWNER_ADDRESS || "").trim();
 const FEED_URL = String(import.meta.env.VITE_QUOTE_API || "").trim().replace(/\/+$/, "");
@@ -22,22 +21,20 @@ function softWarnings() {
 }
 
 /** Owner-only admin control: call set_feed_url with the value of
- * VITE_QUOTE_API. Hidden unless a connected wallet matches
- * VITE_GENLAYER_OWNER_ADDRESS (the contract owner does the deploy → it "just
- * works" when the app owner is signed in). */
+ * VITE_QUOTE_API. Never rendered for visitors — it appears only when the
+ * connected wallet matches VITE_GENLAYER_OWNER_ADDRESS (the contract owner
+ * does the deploy → it "just works" when the app owner is signed in). */
 export function OwnerFeedPanel() {
   const wallet = useWallet();
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState(null);
   const [done, setDone] = useState(false);
 
-  if (!OWNER || !client.live) return null;
-
   const isOwner = wallet.status === "connected" && wallet.account?.toLowerCase() === OWNER.toLowerCase();
-  if (wallet.status === "connected" && !isOwner) return null;
+  if (!OWNER || !client.live || !isOwner) return null;
 
-  const block = isOwner ? hardBlock() : null;
-  const warns = isOwner ? softWarnings() : [];
+  const block = hardBlock();
+  const warns = softWarnings();
 
   const showToast = (msg, kind = "status") => setToast({ msg, kind });
 
@@ -60,43 +57,34 @@ export function OwnerFeedPanel() {
       <div className="container">
         <div className="panel">
           <h2 id="owner-feed-heading">Owner · Contract feed</h2>
-          {!isOwner ? (
-            <p style={{ margin: "12px 0", color: "var(--ink-soft)" }}>
-              Sign in with the owner wallet ({OWNER !== "" && <span className="mono">{shortAddress(OWNER)}</span>})
-              to point the contract's quote feed at your public server.
-            </p>
+          <p style={{ margin: "12px 0", color: "var(--ink-soft)" }}>
+            Target feed (from <span className="mono">VITE_QUOTE_API</span>):
+          </p>
+          <p className="mono" style={{ margin: "4px 0 12px", wordBreak: "break-all" }}>
+            {FEED_URL || <em>not configured</em>}
+          </p>
+          {block ? (
+            <p style={{ color: "var(--amber-ink)", margin: "4px 0", fontSize: "0.85rem" }}>{block}</p>
           ) : (
-            <>
-              <p style={{ margin: "12px 0", color: "var(--ink-soft)" }}>
-                Target feed (from <span className="mono">VITE_QUOTE_API</span>):
+            warns.map((w) => (
+              <p key={w} style={{ color: "var(--amber-ink)", margin: "4px 0", fontSize: "0.85rem" }}>
+                {w}
               </p>
-              <p className="mono" style={{ margin: "4px 0 12px", wordBreak: "break-all" }}>
-                {FEED_URL || <em>not configured</em>}
-              </p>
-{block ? (
-                <p style={{ color: "var(--amber-ink)", margin: "4px 0", fontSize: "0.85rem" }}>{block}</p>
-              ) : (
-                warns.map((w) => (
-                  <p key={w} style={{ color: "var(--amber-ink)", margin: "4px 0", fontSize: "0.85rem" }}>
-                    {w}
-                  </p>
-                ))
-              )}
-              <button
-                type="button"
-                className="btn btn-accent"
-                onClick={setFeed}
-                disabled={busy || Boolean(block)}
-                title="Call set_feed_url with VITE_QUOTE_API"
-              >
-                {busy ? "Setting feed…" : done ? "Feed set ✓" : "Set feed URL on contract"}
-              </button>
-              <p style={{ margin: "10px 0 0", color: "var(--ink-soft)", fontSize: "0.85rem" }}>
-                This calls owner-only <span className="mono">set_feed_url</span>. It does not change the server or
-                redeploy the contract.
-              </p>
-            </>
+            ))
           )}
+          <button
+            type="button"
+            className="btn btn-accent"
+            onClick={setFeed}
+            disabled={busy || Boolean(block)}
+            title="Call set_feed_url with VITE_QUOTE_API"
+          >
+            {busy ? "Setting feed…" : done ? "Feed set ✓" : "Set feed URL on contract"}
+          </button>
+          <p style={{ margin: "10px 0 0", color: "var(--ink-soft)", fontSize: "0.85rem" }}>
+            This calls owner-only <span className="mono">set_feed_url</span>. It does not change the server or
+            redeploy the contract.
+          </p>
         </div>
       </div>
       {toast && (
