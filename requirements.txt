@@ -1,0 +1,2 @@
+# Contract tests run against a mocked `gl` module (no GenLayer node needed).
+pytest>=8.0

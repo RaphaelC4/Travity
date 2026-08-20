@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Travity mark">
+  <rect width="64" height="64" rx="14" fill="#14532d"/>
+  <path d="M16 44 L32 20 L48 44" fill="none" stroke="#f6f4ee" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="32" cy="20" r="4.5" fill="#c47e00"/>
+  <path d="M22 44 h20" stroke="#f6f4ee" stroke-width="5" stroke-linecap="round"/>
+</svg>

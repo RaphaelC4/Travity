@@ -1,0 +1,10 @@
+[build]
+  base = "frontend"
+  command = "npm ci && npm run build"
+  publish = "dist"
+
+# SPA routing: let react-router handle /book, /loyalty, etc.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

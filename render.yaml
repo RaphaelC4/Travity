@@ -1,0 +1,26 @@
+# Render blueprint — deploy the Travity quote server
+# https://dashboard.render.com/blueprints from the repo root picks this up.
+services:
+  - type: web
+    name: travity-server
+    runtime: node
+    rootDir: server
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: QUOTE_PROVIDER
+        value: rapid
+      - key: RAPID_API_KEY
+        sync: false
+      - key: GEN_USD_RATE
+        value: "1.5"
+      - key: GEN_TTL_MS
+        value: "300000"
+      - key: QUOTE_TTL_MS
+        value: "1800000"
+      - key: QUOTE_PROXY_RATE_LIMIT
+        value: "30"

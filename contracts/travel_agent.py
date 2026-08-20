@@ -1,0 +1,448 @@
+# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+from genlayer import *
+import json
+import typing
+from datetime import datetime, timezone
+
+RANGE_PRICE_MAX = u256(10 ** 24)          # wei ceiling: allows real fares (~1e20-1e22 wei)
+DISPUTE_INTERVAL_SECONDS = 600            # 10 min; GenVM exposes tx time, not block height
+LOYALTY_PER_BOOKING = u256(10) * u256(10**18)  # 10 GEN in wei (1 GEN = 10^18 wei)
+ADMIN_ZERO = Address("0x0000000000000000000000000000000000000000")
+
+
+@gl.evm.contract_interface
+class _Payee:
+    """Proxy used only to send GEN to an EOA via an external message."""
+    class View:
+        pass
+    class Write:
+        pass
+
+
+class TravelAgent(gl.Contract):
+    """Travity: AI-native travel agent on GenLayer.
+
+    - quote   -> live travel prices read from the web, agreed by AI validators
+    - book    -> escrows GEN, records the booking (payable)
+    - loyalty -> minted per completed booking, credited overpayment held as credit
+    - dispute -> AI adjudicated refund with appeal path, refund actually paid out
+
+    Security model:
+    - All web/LLM reads run inside non-deterministic consensus blocks via
+      gl.eq_principle.prompt_comparative/prompt_non_comparative, so every
+      validator independently re-fetches and re-derives the value; a caller
+      cannot inject a self-serving quote or ruling.
+    - Checks-effects-interactions: state only mutates after consensus.
+    - Complex records are stored as JSON strings in TreeMap[str, str] rather
+      than raw dicts, since GenVM storage does not support nested dict
+      values directly.
+    - Input validation on every argument; the GenVM reverts on raised errors.
+    - Dispute filing is rate-limited per address (actually enforced).
+    - Owner-only pause/unpause/kill escape hatches; kill is irreversible.
+    """
+
+    owner: Address
+    paused: bool
+    killed: bool
+    quotes: TreeMap[str, u256]
+    bookings: TreeMap[str, str]        # booking_id -> JSON string
+    loyalty: TreeMap[Address, u256]
+    disputes: TreeMap[str, str]        # dispute_id -> JSON string
+    last_dispute_time: TreeMap[Address, u256]
+    feed_base: str                     # provider feed root; owner-adjustable
+
+    def __init__(self, owner: Address):
+        # GenVM decodes constructor address args from the raw 20-byte calldata
+        # as an int (confirmed by the deploy tx: "'int' object has no attribute
+        # 'as_bytes'" in the storage setter). Normalize any int/bytes form so the
+        # Address descriptor never receives a bare int.
+        if isinstance(owner, int):
+            owner = Address("0x" + format(owner, "040x"))
+        elif isinstance(owner, bytes):
+            owner = Address("0x" + owner.hex())
+        self.owner = owner
+        self.paused = False
+        self.killed = False
+        # NOTE: quotes/bookings/loyalty/disputes/last_dispute_time are
+        # TreeMap[...] storage fields. GenVM zero-initializes storage fields
+        # automatically (TreeMap -> {}), so they must NOT be re-assigned here.
+        # Assigning a bare, unparameterized TreeMap() fails GenVM's storage
+        # type-descriptor check (`val.__type_desc__ == self`), since a fresh
+        # TreeMap() doesn't carry the same specialized type as the declared
+        # TreeMap[K, V] field. Leaving them untouched keeps them at {}.
+        self.feed_base = "https://api.example-travel-provider.com"
+
+    # -- Admin ---------------------------------------------------------------
+
+    def _only_owner(self):
+        if gl.message.sender_address != self.owner:
+            raise gl.vm.UserError("only owner")
+
+    def _unpaused(self):
+        if self.paused or self.killed:
+            raise gl.vm.UserError("contract paused")
+
+    @gl.public.write
+    def pause(self) -> None:
+        self._only_owner()
+        self.paused = True
+
+    @gl.public.write
+    def unpause(self) -> None:
+        self._only_owner()
+        self.paused = False
+
+    @gl.public.write
+    def kill(self) -> None:
+        """Permanent halt. No unkill exists."""
+        self._only_owner()
+        self.killed = True
+
+    @gl.public.write
+    def set_feed_url(self, url: str) -> None:
+        """Owner-only: repoint the provider feed without redeploying.
+
+        Guards: https-only, non-empty. The feed root is joined with the
+        endpoint paths inside the consensus blocks (quote / status).
+        """
+        self._only_owner()
+        if not isinstance(url, str) or not url.startswith("https://"):
+            raise gl.vm.UserError("feed url must be an https URL")
+        self.feed_base = url.rstrip("/")
+
+    # -- Helpers -------------------------------------------------------------
+
+    def _valid_route(self, origin: str, destination: str) -> bool:
+        if not isinstance(origin, str) or not isinstance(destination, str):
+            return False
+        o, d = origin.upper(), destination.upper()
+        if len(o) != 3 or not o.isalpha() or len(d) != 3 or not d.isalpha():
+            return False
+        return o != d
+
+    def _valid_dates(self, depart: int, ret: int) -> bool:
+        if depart is None or ret is None:
+            return False
+        if depart >= ret:
+            return False
+        return True
+
+    def _current_time(self) -> u256:
+        # GenVM exposes no block number/height — confirmed by docs
+        # (Transaction Context: "No block number, no block hash"). Time is
+        # deterministic and pinned to the tx timestamp, so use that instead.
+        return u256(int(datetime.now(timezone.utc).timestamp()))
+
+    def _quote_key(self, origin: str, destination: str, depart: int = 0, ret: int = 0) -> str:
+        """Cache key for an agreed quote. Route-only when no dates are given,
+        otherwise route + departure + return so the agreed price matches the
+        exact trip requested (date parity between the UI and the escrow)."""
+        key = origin.upper() + "-" + destination.upper()
+        if depart and ret:
+            key += "-" + str(depart) + "-" + str(ret)
+        return key
+
+    @gl.public.view
+    def view_quote(self, origin: str, destination: str, depart: int = 0, ret: int = 0) -> dict:
+        """Read a cached quote (deterministic). Empty dict if none cached."""
+        key = self._quote_key(origin, destination, depart, ret)
+        price = self.quotes.get(key)
+        if price is None:
+            return {}
+        return {"route": key, "price_wei": int(price)}
+
+    @gl.public.view
+    def view_booking(self, booking_id: str) -> dict:
+        raw = self.bookings.get(booking_id)
+        if raw is None:
+            return {}
+        return json.loads(raw)
+
+    # -- Quote ---------------------------------------------------------------
+
+    @gl.public.write
+    def refresh_quote(self, origin: str, destination: str, depart: int = 0, ret: int = 0) -> u256:
+        """Fetch a live price from the web and agree on it via consensus.
+
+        Runs inside a non-deterministic block settled with comparative
+        consensus (gl.eq_principle.prompt_comparative), so every validator
+        re-fetches the provider independently. Returns the agreed price in wei.
+        When both depart/ret are given, the feed is queried for those dates so
+        the agreed price matches the requested trip.
+        """
+        self._unpaused()
+        if not self._valid_route(origin, destination):
+            raise gl.vm.UserError("invalid route")
+        if depart or ret:
+            if not self._valid_dates(depart, ret):
+                raise gl.vm.UserError("invalid dates")
+        o, d = origin.upper(), destination.upper()
+        key = self._quote_key(o, d, depart, ret)
+
+        # Storage reads (self.feed_base) must happen OUTSIDE the consensus
+        # closure: GenVM warns "Reading storage in nondet mode is not
+        # supported" (storage.py:21). Capture the feed root as a local before
+        # the closure so all validators pickle/use the same plain string. Also
+        # turn an unconfigured placeholder feed into a clear error instead of a
+        # DNS NondetException deep inside the consensus block.
+        feed = self.feed_base
+        if not feed.startswith("https://") or "example-travel-provider" in feed:
+            raise gl.vm.UserError("quote feed not configured: owner must call set_feed_url")
+
+        def get_price() -> str:
+            q = "/quote?from=" + o + "&to=" + d
+            if depart and ret:
+                q += "&depart=" + str(depart) + "&ret=" + str(ret)
+            res = gl.nondet.web.get(feed + q)
+            page = res.body.decode("utf-8")
+            return gl.nondet.exec_prompt(
+                "Extract the total ticket price in integer wei from this "
+                "page and reply with only the number: " + page[:4000]
+            )
+
+        # strict_eq must never be used on LLM output (it's non-deterministic
+        # and exact-match will spuriously fail); use comparative consensus
+        # with an explicit tolerance principle instead.
+        agreed = gl.eq_principle.prompt_comparative(
+            get_price,
+            "The two values are the same ticket price in wei, allowing up "
+            "to 5% difference due to live price fluctuation.",
+        )
+        try:
+            price = u256(int(str(agreed).strip()))
+        except Exception:
+            raise gl.vm.UserError("unreadable price")
+        if price <= u256(0) or price > RANGE_PRICE_MAX:
+            raise gl.vm.UserError("price out of range")
+
+        self.quotes[key] = price  # state mutation happens AFTER consensus
+        return price
+
+    # -- Booking -------------------------------------------------------------
+
+    @gl.public.write.payable
+    def book(self, origin: str, destination: str, depart: int, ret: int) -> str:
+        """Escrow GEN for a booking.
+
+        The caller must send at least the last agreed quote price in wei.
+        Overpayment is credited to loyalty; underpayment reverts;
+        amounts far above the quote (grief/dust attempts) revert.
+        """
+        self._unpaused()
+        if not self._valid_route(origin, destination):
+            raise gl.vm.UserError("invalid route")
+        if not self._valid_dates(depart, ret):
+            raise gl.vm.UserError("invalid dates")
+
+        key = self._quote_key(origin, destination, depart, ret)
+        price = self.quotes.get(key)
+        if price is None or price <= u256(0):
+            raise gl.vm.UserError("no agreed quote; call refresh_quote first")
+
+        sent = gl.message.value
+        if sent < price:
+            raise gl.vm.UserError("insufficient payment")
+        if sent > price * u256(2):
+            raise gl.vm.UserError("payment far exceeds quote")
+
+        sender = gl.message.sender_address
+        booking_id = key + "-" + str(sender)
+        if self.bookings.get(booking_id) is not None:
+            raise gl.vm.UserError("duplicate booking")
+
+        over = sent - price
+        record = {
+            "route": key,
+            "customer": str(sender),
+            "depart": depart,
+            "ret": ret,
+            "price_wei": int(price),
+            "paid_wei": int(sent),
+            "status": "confirmed",
+            "completion_verified": False,
+        }
+        self.bookings[booking_id] = json.dumps(record)
+        if over > u256(0):
+            self.loyalty[sender] = self.loyalty.get(sender, u256(0)) + over
+        return booking_id
+
+    @gl.public.write
+    def confirm_completion(self, booking_id: str) -> None:
+        """Verify a trip completed via live web data, then mint loyalty
+        to the CUSTOMER who made the booking (not the caller).
+
+        Verification runs inside a prompt_non_comparative consensus block,
+        so validators check the provider independently and a booking cannot
+        be self-confirmed. Owner-gated since it issues value-bearing loyalty.
+        """
+        self._only_owner()
+        raw = self.bookings.get(booking_id)
+        if raw is None:
+            raise gl.vm.UserError("unknown booking")
+        booking = json.loads(raw)
+        if booking["status"] != "confirmed" or booking["completion_verified"]:
+            raise gl.vm.UserError("booking not verifiable")
+
+        feed = self.feed_base
+
+        def get_status() -> str:
+            res = gl.nondet.web.get(
+                feed + "/status?ref=" + booking_id
+            )
+            page = res.body.decode("utf-8")
+            ok = gl.nondet.exec_prompt(
+                "Did this trip complete without full cancellation? "
+                "Answer only yes or no. " + page[:4000]
+            )
+            return ok.strip().lower()
+
+        # prompt_non_comparative takes (fn, task=, criteria=) — not (fn, principle) —
+        # confirmed against docs.genlayer.com/.../examples/llm-hello-world-non-comparative.
+        # Validators evaluate the leader's answer against these criteria rather than
+        # re-deriving and comparing values, which fits a yes/no judgment call better
+        # than prompt_comparative.
+        verdict = gl.eq_principle.prompt_non_comparative(
+            get_status,
+            task="Answer only 'yes' or 'no': did this trip complete without full cancellation?",
+            criteria="Response must be a clear yes/no-style answer about trip completion.",
+        )
+        if str(verdict).lower() not in ("yes", "true", "1", "done", "completed"):
+            raise gl.vm.UserError("trip completion not verified")
+
+        booking["status"] = "completed"
+        booking["completion_verified"] = True
+        self.bookings[booking_id] = json.dumps(booking)
+
+        customer = Address(booking["customer"])
+        self.loyalty[customer] = self.loyalty.get(customer, u256(0)) + LOYALTY_PER_BOOKING
+
+    # -- Disputes ------------------------------------------------------------
+
+    @gl.public.write
+    def file_dispute(self, booking_id: str, reason: str) -> str:
+        """File an AI-adjudicated dispute. Rate-limited per address."""
+        self._unpaused()
+        sender = gl.message.sender_address
+        now = self._current_time()
+        last = self.last_dispute_time.get(sender, u256(0))
+        if last > u256(0) and (now - last) < u256(DISPUTE_INTERVAL_SECONDS):
+            raise gl.vm.UserError("dispute rate limit: try again later")
+
+        raw = self.bookings.get(booking_id)
+        if raw is None:
+            raise gl.vm.UserError("unknown booking")
+        booking = json.loads(raw)
+        if booking["status"] == "disputed":
+            raise gl.vm.UserError("already disputed")
+        if not isinstance(reason, str) or len(reason) < 10 or len(reason) > 500:
+            raise gl.vm.UserError("invalid dispute reason")
+
+        booking["status"] = "disputed"
+        self.bookings[booking_id] = json.dumps(booking)
+
+        self.last_dispute_time[sender] = now
+
+        dispute_id = booking_id + "-" + str(sender)
+        dispute_record = {
+            "booking_id": booking_id,
+            "claimant": str(sender),
+            "reason": reason,
+            "status": "pending",
+            "rounds": 0,
+            "refund_wei": 0,
+            "paid_out": False,
+        }
+        self.disputes[dispute_id] = json.dumps(dispute_record)
+        return dispute_id
+
+    @gl.public.write
+    def escalate(self, dispute_id: str, refund_floor_hint: u256) -> u256:
+        """Produce the AI adjudication for a dispute and pay the refund out.
+
+        Validators weigh the reason and live provider evidence via a
+        prompt_comparative consensus block, settle on a refund in wei capped at the
+        booking price, then the refund is transferred to the claimant.
+        refund_floor_hint is only a hint; consensus decides the number.
+        """
+        raw_dispute = self.disputes.get(dispute_id)
+        if raw_dispute is None:
+            raise gl.vm.UserError("unknown dispute")
+        dispute = json.loads(raw_dispute)
+
+        raw_booking = self.bookings.get(dispute["booking_id"])
+        if raw_booking is None:
+            raise gl.vm.UserError("booking not found")
+        booking = json.loads(raw_booking)
+
+        if dispute["status"] == "ruled" and dispute.get("paid_out"):
+            raise gl.vm.UserError("dispute already settled")
+
+        dispute["rounds"] = dispute["rounds"] + 1
+        price_max = u256(booking["price_wei"])
+        reason = str(dispute["reason"])
+
+        # Same nondet-storage rule as refresh_quote/confirm_completion: capture
+        # the feed root before the closure instead of reading storage inside it.
+        feed = self.feed_base
+
+        def get_ruling() -> str:
+            try:
+                res = gl.nondet.web.get(
+                    feed + "/status?ref=" + dispute["booking_id"]
+                )
+                evidence = res.body.decode("utf-8")[:2000]
+            except Exception:
+                evidence = "provider status unavailable"
+            return gl.nondet.exec_prompt(
+                "Travity travel dispute. Reason: " + reason +
+                ". Booking price (wei): " + str(price_max) +
+                ". Provider status: " + evidence +
+                ". Decide a fair refund in integer wei from 0 to " +
+                str(price_max) + ". Reply only with the number."
+            )
+
+        agreed = gl.eq_principle.prompt_comparative(
+            get_ruling,
+            "The two values are the same refund amount in wei, allowing "
+            "up to 10% difference given the judgment call involved.",
+        )
+        try:
+            refund = u256(int(str(agreed).strip()))
+        except Exception:
+            refund = u256(0)
+        if refund > price_max:
+            refund = price_max
+
+        dispute["status"] = "ruled"
+        dispute["refund_wei"] = int(refund)
+        self.disputes[dispute_id] = json.dumps(dispute)
+
+        if refund > u256(0):
+            claimant = Address(dispute["claimant"])
+            # Confirmed against docs.genlayer.com/.../features/value-transfers:
+            # sending GEN to an EOA is an external message, done through an
+            # @gl.evm.contract_interface proxy's emit_transfer(value=...).
+            # There is no bare gl.emit_transfer() — that was an unverified guess.
+            _Payee(claimant).emit_transfer(value=refund)
+            dispute["paid_out"] = True
+            self.disputes[dispute_id] = json.dumps(dispute)
+
+        return refund
+
+    @gl.public.view
+    def view_dispute(self, dispute_id: str) -> dict:
+        raw = self.disputes.get(dispute_id)
+        if raw is None:
+            return {}
+        d = json.loads(raw)
+        return {
+            "booking_id": d["booking_id"],
+            "status": d["status"],
+            "rounds": int(d["rounds"]),
+            "refund_wei": int(d.get("refund_wei", 0)),
+            "paid_out": bool(d.get("paid_out", False)),
+        }
+
+    @gl.public.view
+    def balance_of(self, who: Address) -> u256:
+        return self.loyalty.get(who, u256(0))
