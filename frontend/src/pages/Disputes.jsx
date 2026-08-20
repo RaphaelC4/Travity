@@ -69,7 +69,7 @@ export default function Disputes() {
             <h2>File a dispute</h2>
             <div className="form-field">
               <label htmlFor="bid">Booking reference</label>
-              <input id="bid" value={bookingId} onChange={(e) => setBookingId(e.target.value)} placeholder="JFK-SFO-20261201-20261210-0xc048310B6AD26D7cf35eF068A83CBe6793864Fd1" className="mono" aria-describedby="bid-hint" />
+              <input id="bid" value={bookingId} onChange={(e) => setBookingId(e.target.value)} placeholder="JFK-SFO-20261201-20261210-0xaa11bb22cc33dd44ee55ff66778899aabbccddee" className="mono" aria-describedby="bid-hint" />
             </div>
             <p className="hint" id="bid-hint">Paste the booking id shown after your last successful booking — it ends in your checksummed address.</p>
             <div className={`form-field ${errors.reason ? "is-error" : ""}`}>
