@@ -17,7 +17,7 @@ services:
       - key: RAPID_API_KEY
         sync: false
       - key: GEN_USD_RATE
-        value: "1.5"
+        value: "200"
       - key: GEN_TTL_MS
         value: "300000"
       - key: QUOTE_TTL_MS
