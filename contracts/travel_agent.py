@@ -324,7 +324,10 @@ class TravelAgent(gl.Contract):
             raise gl.vm.UserError("invalid dates")
         if not self._valid_ref(reservation_ref):
             raise gl.vm.UserError("invalid reservation reference")
-        ref = reservation_ref.strip()
+        # Normalized to uppercase at write time so the strict_eq comparison
+        # in confirm_completion/escalate (which uppercases the provider's
+        # echoed ref) can never mismatch on case alone.
+        ref = reservation_ref.strip().upper()
 
         key = self._quote_key(origin, destination, depart, ret)
         price = self.quotes.get(key)
@@ -421,7 +424,7 @@ class TravelAgent(gl.Contract):
                 return "no"
             echoed_ref = str(page.get("ref", "")).strip().upper()
             status = str(page.get("status", "")).strip().lower()
-            if echoed_ref == ref and status == "completed":
+            if echoed_ref == ref.strip().upper() and status == "completed":
                 return "yes"
             return "no"
 
