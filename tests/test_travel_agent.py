@@ -416,6 +416,39 @@ class TestDispute:
             agent.escalate(dispute_id, u256(0))
 
 
+class TestAdmin:
+    """set_provider / set_provider_auth owner gates and arg normalization."""
+
+    def test_set_provider_accepts_native_address_instance(self, agent, monkeypatch):
+        """GenVM hands write-method Address params to the contract as a native
+        Address instance (not int/bytes/str). _normalize_address must pass it
+        through instead of reverting 'invalid address' (prod regression)."""
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")
+
+        class Address:  # same shape as the GenVM-native type: class named Address
+            def __init__(self, value):
+                self.value = value
+
+            def __eq__(self, other):
+                return str(self) == str(other)
+
+            def __str__(self):
+                return self.value
+
+        agent.set_provider(Address("0xPAYOUT"))
+        assert agent.provider_address == Address("0xPAYOUT")
+
+    def test_set_provider_rejects_non_owner(self, agent, monkeypatch):
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
+        with pytest.raises(RuntimeError, match="only owner"):
+            agent.set_provider("0xPAYOUT")
+
+    def test_set_provider_auth_rejects_short_token(self, agent, monkeypatch):
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")
+        with pytest.raises(RuntimeError, match="too short"):
+            agent.set_provider_auth("short")
+
+
 class TestGuard:
     def test_killed_contract_refuses_operations(self, agent, monkeypatch):
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")

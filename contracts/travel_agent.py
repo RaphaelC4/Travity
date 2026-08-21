@@ -75,10 +75,16 @@ class TravelAgent(gl.Contract):
     # -- Admin ---------------------------------------------------------------
 
     def _normalize_address(self, addr) -> Address:
-        """GenVM decodes calldata address args (constructor, write-methods)
-        as a raw int, or bytes with the leading zero byte stripped. Normalize
-        every form so the Address storage setter never receives a bare int
-        (see the deploy-tx traceback: 'int' object has no attribute 'as_bytes')."""
+        """GenVM decodes calldata address args in different shapes per entry
+        point: the constructor receives a raw int, write-method Address params
+        arrive as a native Address instance, and bytes forms may have the
+        leading zero byte stripped. Normalize every observed form so the
+        Address storage setter never receives a bare int (see the deploy-tx
+        traceback: 'int' object has no attribute 'as_bytes'). The native
+        instance is matched by class name because `isinstance` would break
+        wherever Address is not importable as a type (test mocks)."""
+        if addr.__class__.__name__ == "Address":
+            return addr
         if isinstance(addr, bytes):
             hexbytes = addr.hex() if len(addr) == 20 else addr.rjust(20, b"\x00").hex()
             return Address("0x" + hexbytes)
