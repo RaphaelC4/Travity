@@ -113,9 +113,12 @@ def _install_gl_mock():
 
 
 class _FakeResponse:
-    def __init__(self, text, status_code=200):
+    """Matches the real GenVM nondet web Response shape: `.status` + `.body`.
+    (The runtime has no `.status_code` — that's a docs error.)"""
+
+    def __init__(self, text, status=200):
         self.body = text.encode("utf-8")
-        self.status_code = status_code
+        self.status = status
 
 
 _install_gl_mock()
@@ -309,7 +312,7 @@ class TestLoyalty:
 
         monkeypatch.setattr(
             "genlayer.gl.nondet.web.get",
-            lambda url, headers=None: _FakeResponse("401", status_code=401),
+            lambda url, headers=None: _FakeResponse("401", status=401),
         )
         monkeypatch.setattr("genlayer.gl.nondet.exec_prompt", lambda p: "yes")  # even if the LLM would say yes
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")

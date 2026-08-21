@@ -10,6 +10,16 @@ LOYALTY_PER_BOOKING = u256(10) * u256(10**18)  # 10 GEN in wei (1 GEN = 10^18 we
 ADMIN_ZERO = Address("0x0000000000000000000000000000000000000000")
 
 
+def _http_status(res) -> int:
+    """HTTP status of a gl.nondet.web Response. The GenVM runtime exposes
+    `.status`; some doc examples (and our test mocks) use `.status_code`.
+    Read whichever exists; 0 (treated as an error by callers) if neither."""
+    status = getattr(res, "status", None)
+    if status is None:
+        status = getattr(res, "status_code", None)
+    return int(status) if status is not None else 0
+
+
 @gl.evm.contract_interface
 class _Payee:
     """Proxy used only to send GEN to an EOA via an external message."""
@@ -374,7 +384,7 @@ class TravelAgent(gl.Contract):
                 feed + "/status?ref=" + ref,
                 headers={"Authorization": "Bearer " + token},
             )
-            if res.status_code != 200:
+            if _http_status(res) != 200:
                 # auth failure or provider error is not evidence of anything
                 return "no"
             page = res.body.decode("utf-8")
@@ -516,7 +526,7 @@ class TravelAgent(gl.Contract):
                     feed + "/status?ref=" + ref,
                     headers={"Authorization": "Bearer " + token},
                 )
-                if res.status_code != 200:
+                if _http_status(res) != 200:
                     evidence = "provider evidence unavailable (auth/status error)"
                 else:
                     evidence = res.body.decode("utf-8")[:2000]
