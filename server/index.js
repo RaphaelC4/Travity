@@ -1,623 +1,724 @@
-# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
-from genlayer import *
-import json
-import typing
-from datetime import datetime, timezone
-
-RANGE_PRICE_MAX = u256(10 ** 24)          # wei ceiling: allows real fares (~1e20-1e22 wei)
-DISPUTE_INTERVAL_SECONDS = 600            # 10 min; GenVM exposes tx time, not block height
-LOYALTY_PER_BOOKING = u256(10) * u256(10**18)  # 10 GEN in wei (1 GEN = 10^18 wei)
-ADMIN_ZERO = Address("0x0000000000000000000000000000000000000000")
-
-
-def _http_status(res) -> int:
-    """HTTP status of a gl.nondet.web Response. The GenVM runtime exposes
-    `.status`; some doc examples (and our test mocks) use `.status_code`.
-    Read whichever exists; 0 (treated as an error by callers) if neither."""
-    status = getattr(res, "status", None)
-    if status is None:
-        status = getattr(res, "status_code", None)
-    return int(status) if status is not None else 0
-
-
-@gl.evm.contract_interface
-class _Payee:
-    """Proxy used only to send GEN to an EOA via an external message."""
-    class View:
-        pass
-    class Write:
-        pass
-
-
-class TravelAgent(gl.Contract):
-    """Travity: AI-native travel agent on GenLayer.
-
-    - quote   -> live travel prices read from the web, agreed by AI validators
-    - book    -> escrows GEN, records the booking (payable)
-    - loyalty -> minted per completed booking, credited overpayment held as credit
-    - dispute -> AI adjudicated refund with appeal path, refund actually paid out
-
-    Security model:
-    - All web/LLM reads run inside non-deterministic consensus blocks via
-      gl.eq_principle.prompt_comparative/prompt_non_comparative, so every
-      validator independently re-fetches and re-derives the value; a caller
-      cannot inject a self-serving quote or ruling.
-    - Checks-effects-interactions: state only mutates after consensus.
-    - Complex records are stored as JSON strings in TreeMap[str, str] rather
-      than raw dicts, since GenVM storage does not support nested dict
-      values directly.
-    - Input validation on every argument; the GenVM reverts on raised errors.
-    - Dispute filing is rate-limited per address (actually enforced).
-    - Owner-only pause/unpause/kill escape hatches; kill is irreversible.
-    """
-
-    owner: Address
-    paused: bool
-    killed: bool
-    quotes: TreeMap[str, u256]
-    bookings: TreeMap[str, str]        # booking_id -> JSON string
-    loyalty: TreeMap[Address, u256]
-    disputes: TreeMap[str, str]        # dispute_id -> JSON string
-    last_dispute_time: TreeMap[Address, u256]
-    feed_base: str                     # provider feed root; owner-adjustable
-    provider_address: Address          # carrier/agency settlement payout address
-    provider_auth_token: str           # bearer token for authenticated provider reads
-
-    def __init__(self, owner: Address):
-        # GenVM decodes constructor address args from the raw 20-byte calldata
-        # as an int (confirmed by the deploy tx: "'int' object has no attribute
-        # 'as_bytes'" in the storage setter). Normalize any int/bytes form so the
-        # Address descriptor never receives a bare int.
-        self.owner = self._normalize_address(owner)
-        self.paused = False
-        self.killed = False
-        # NOTE: quotes/bookings/loyalty/disputes/last_dispute_time are
-        # TreeMap[...] storage fields. GenVM zero-initializes storage fields
-        # automatically (TreeMap -> {}), so they must NOT be re-assigned here.
-        # Assigning a bare, unparameterized TreeMap() fails GenVM's storage
-        # type-descriptor check (`val.__type_desc__ == self`), since a fresh
-        # TreeMap() doesn't carry the same specialized type as the declared
-        # TreeMap[K, V] field. Leaving them untouched keeps them at {}.
-        self.feed_base = "https://api.example-travel-provider.com"
-        self.provider_address = ADMIN_ZERO
-        self.provider_auth_token = ""
-
-    # -- Admin ---------------------------------------------------------------
-
-    def _normalize_address(self, addr) -> Address:
-        """GenVM decodes calldata address args in different shapes per entry
-        point: the constructor receives a raw int, write-method Address params
-        arrive as a native Address instance, and bytes forms may have the
-        leading zero byte stripped. Normalize every observed form so the
-        Address storage setter never receives a bare int (see the deploy-tx
-        traceback: 'int' object has no attribute 'as_bytes'). The native
-        instance is matched by class name because `isinstance` would break
-        wherever Address is not importable as a type (test mocks)."""
-        if addr.__class__.__name__ == "Address":
-            return addr
-        if isinstance(addr, bytes):
-            hexbytes = addr.hex() if len(addr) == 20 else addr.rjust(20, b"\x00").hex()
-            return Address("0x" + hexbytes)
-        if isinstance(addr, int):
-            return Address("0x" + format(addr, "040x"))
-        if isinstance(addr, str) and addr.startswith("0x"):
-            return Address(addr)
-        raise gl.vm.UserError("invalid address")
-
-    def _only_owner(self):
-        if gl.message.sender_address != self.owner:
-            raise gl.vm.UserError("only owner")
-
-    def _unpaused(self):
-        if self.paused or self.killed:
-            raise gl.vm.UserError("contract paused")
-
-    @gl.public.write
-    def pause(self) -> None:
-        self._only_owner()
-        self.paused = True
-
-    @gl.public.write
-    def unpause(self) -> None:
-        self._only_owner()
-        self.paused = False
-
-    @gl.public.write
-    def kill(self) -> None:
-        """Permanent halt. No unkill exists."""
-        self._only_owner()
-        self.killed = True
-
-    @gl.public.write
-    def set_feed_url(self, url: str) -> None:
-        """Owner-only: repoint the provider feed without redeploying.
-
-        Guards: https-only, non-empty. The feed root is joined with the
-        endpoint paths inside the consensus blocks (quote / status).
-        """
-        self._only_owner()
-        if not isinstance(url, str) or not url.startswith("https://"):
-            raise gl.vm.UserError("feed url must be an https URL")
-        self.feed_base = url.rstrip("/")
-
-    @gl.public.write
-    def set_provider(self, address: Address) -> None:
-        """Owner-only: the carrier/agency settlement payout address.
-
-        Receives the escrowed fare once a completion is verified, or the
-        non-refunded remainder once a dispute is ruled. This is what makes
-        settlement a defined path instead of funds sitting in the contract
-        indefinitely.
-        """
-        self._only_owner()
-        self.provider_address = self._normalize_address(address)
-
-    @gl.public.write
-    def set_provider_auth(self, token: str) -> None:
-        """Owner-only: bearer token attached to provider status reads.
-
-        Without this, `confirm_completion`/`escalate` would treat an
-        unauthenticated, spoofable page fetch as evidence. The token ties
-        the read to a real, authenticated carrier/agency session.
-        """
-        self._only_owner()
-        if not isinstance(token, str) or len(token.strip()) < 8:
-            raise gl.vm.UserError("provider auth token too short")
-        self.provider_auth_token = token.strip()
-
-    # -- Helpers -------------------------------------------------------------
-
-    def _valid_route(self, origin: str, destination: str) -> bool:
-        if not isinstance(origin, str) or not isinstance(destination, str):
-            return False
-        o, d = origin.upper(), destination.upper()
-        if len(o) != 3 or not o.isalpha() or len(d) != 3 or not d.isalpha():
-            return False
-        return o != d
-
-    def _valid_dates(self, depart: int, ret: int) -> bool:
-        if depart is None or ret is None:
-            return False
-        if depart >= ret:
-            return False
-        return True
-
-    def _valid_ref(self, ref: str) -> bool:
-        """A reservation_ref ties the on-chain escrow to a real, off-chain
-        reservation (e.g. the PNR/confirmation code the provider issued when
-        the reservation was created). Format-check only; the reference is
-        actually verified against provider evidence at completion/dispute
-        time, not trusted at face value here."""
-        if not isinstance(ref, str):
-            return False
-        r = ref.strip()
-        return 4 <= len(r) <= 128
-
-    def _current_time(self) -> u256:
-        # GenVM exposes no block number/height — confirmed by docs
-        # (Transaction Context: "No block number, no block hash"). Time is
-        # deterministic and pinned to the tx timestamp, so use that instead.
-        return u256(int(datetime.now(timezone.utc).timestamp()))
-
-    def _quote_key(self, origin: str, destination: str, depart: int = 0, ret: int = 0) -> str:
-        """Cache key for an agreed quote. Route-only when no dates are given,
-        otherwise route + departure + return so the agreed price matches the
-        exact trip requested (date parity between the UI and the escrow)."""
-        key = origin.upper() + "-" + destination.upper()
-        if depart and ret:
-            key += "-" + str(depart) + "-" + str(ret)
-        return key
-
-    @gl.public.view
-    def view_quote(self, origin: str, destination: str, depart: int = 0, ret: int = 0) -> dict:
-        """Read a cached quote (deterministic). Empty dict if none cached."""
-        key = self._quote_key(origin, destination, depart, ret)
-        price = self.quotes.get(key)
-        if price is None:
-            return {}
-        return {"route": key, "price_wei": int(price)}
-
-    @gl.public.view
-    def view_booking(self, booking_id: str) -> dict:
-        raw = self.bookings.get(booking_id)
-        if raw is None:
-            return {}
-        return json.loads(raw)
-
-    @gl.public.view
-    def view_provider_config(self) -> dict:
-        """Diagnostics: the owner-set settlement + auth configuration. The
-        token is already public on-chain (docs/security.md trade-off), so
-        returning it here leaks nothing new — it makes misconfiguration
-        (wrong/missing bearer token vs the provider's expected value)
-        diagnosable instead of a silent 401 inside a consensus block."""
-        return {
-            "provider_address": str(self.provider_address),
-            "feed_base": self.feed_base,
-            "auth_token": self.provider_auth_token,
-            "auth_configured": self.provider_auth_token != "",
-        }
-
-    # -- Quote ---------------------------------------------------------------
-
-    @gl.public.write
-    def refresh_quote(self, origin: str, destination: str, depart: int = 0, ret: int = 0) -> u256:
-        """Fetch a live price from the web and agree on it via consensus.
-
-        Runs inside a non-deterministic block settled with comparative
-        consensus (gl.eq_principle.prompt_comparative), so every validator
-        re-fetches the provider independently. Returns the agreed price in wei.
-        When both depart/ret are given, the feed is queried for those dates so
-        the agreed price matches the requested trip.
-        """
-        self._unpaused()
-        if not self._valid_route(origin, destination):
-            raise gl.vm.UserError("invalid route")
-        if depart or ret:
-            if not self._valid_dates(depart, ret):
-                raise gl.vm.UserError("invalid dates")
-        o, d = origin.upper(), destination.upper()
-        key = self._quote_key(o, d, depart, ret)
-
-        # Storage reads (self.feed_base) must happen OUTSIDE the consensus
-        # closure: GenVM warns "Reading storage in nondet mode is not
-        # supported" (storage.py:21). Capture the feed root as a local before
-        # the closure so all validators pickle/use the same plain string. Also
-        # turn an unconfigured placeholder feed into a clear error instead of a
-        # DNS NondetException deep inside the consensus block.
-        feed = self.feed_base
-        if not feed.startswith("https://") or "example-travel-provider" in feed:
-            raise gl.vm.UserError("quote feed not configured: owner must call set_feed_url")
-
-        def get_price() -> str:
-            q = "/quote?from=" + o + "&to=" + d
-            if depart and ret:
-                q += "&depart=" + str(depart) + "&ret=" + str(ret)
-            res = gl.nondet.web.get(feed + q)
-            page = res.body.decode("utf-8")
-            return gl.nondet.exec_prompt(
-                "Extract the total ticket price in integer wei from this "
-                "page and reply with only the number: " + page[:4000]
-            )
-
-        # strict_eq must never be used on LLM output (it's non-deterministic
-        # and exact-match will spuriously fail); use comparative consensus
-        # with an explicit tolerance principle instead.
-        agreed = gl.eq_principle.prompt_comparative(
-            get_price,
-            "The two values are the same ticket price in wei, allowing up "
-            "to 5% difference due to live price fluctuation.",
-        )
-        try:
-            price = u256(int(str(agreed).strip()))
-        except Exception:
-            raise gl.vm.UserError("unreadable price")
-        if price <= u256(0) or price > RANGE_PRICE_MAX:
-            raise gl.vm.UserError("price out of range")
-
-        self.quotes[key] = price  # state mutation happens AFTER consensus
-        return price
-
-    # -- Booking -------------------------------------------------------------
-
-    @gl.public.write.payable
-    def book(self, origin: str, destination: str, depart: int, ret: int, reservation_ref: str) -> str:
-        """Escrow GEN for a booking.
-
-        The caller must send at least the last agreed quote price in wei.
-        Overpayment is credited to loyalty; underpayment reverts;
-        amounts far above the quote (grief/dust attempts) revert.
-
-        `reservation_ref` is the PNR/confirmation code the carrier or agency
-        issued when the reservation was actually created off-chain (the
-        server creates the reservation via the provider's booking API before
-        the customer escrows funds, and passes the resulting reference
-        through here). It's only format-checked at booking time — it's the
-        anchor that `confirm_completion`/`escalate` later verify against
-        authenticated provider evidence, so a caller can't just make one up
-        and have it accepted as proof of anything.
-        """
-        self._unpaused()
-        if not self._valid_route(origin, destination):
-            raise gl.vm.UserError("invalid route")
-        if not self._valid_dates(depart, ret):
-            raise gl.vm.UserError("invalid dates")
-        if not self._valid_ref(reservation_ref):
-            raise gl.vm.UserError("invalid reservation reference")
-        # Normalized to uppercase at write time so the strict_eq comparison
-        # in confirm_completion/escalate (which uppercases the provider's
-        # echoed ref) can never mismatch on case alone.
-        ref = reservation_ref.strip().upper()
-
-        key = self._quote_key(origin, destination, depart, ret)
-        price = self.quotes.get(key)
-        if price is None or price <= u256(0):
-            raise gl.vm.UserError("no agreed quote; call refresh_quote first")
-
-        sent = gl.message.value
-        if sent < price:
-            raise gl.vm.UserError("insufficient payment")
-        if sent > price * u256(2):
-            raise gl.vm.UserError("payment far exceeds quote")
-
-        sender = gl.message.sender_address
-        booking_id = key + "-" + str(sender)
-        if self.bookings.get(booking_id) is not None:
-            raise gl.vm.UserError("duplicate booking")
-
-        over = sent - price
-        record = {
-            "route": key,
-            "customer": str(sender),
-            "depart": depart,
-            "ret": ret,
-            "reservation_ref": ref,
-            "price_wei": int(price),
-            "paid_wei": int(sent),
-            "status": "confirmed",
-            "completion_verified": False,
-            "settled": False,
-            "settled_wei": 0,
-        }
-        self.bookings[booking_id] = json.dumps(record)
-        if over > u256(0):
-            self.loyalty[sender] = self.loyalty.get(sender, u256(0)) + over
-        return booking_id
-
-    @gl.public.write
-    def confirm_completion(self, booking_id: str) -> None:
-        """Verify a trip completed using AUTHENTICATED carrier/agency
-        evidence tied to this booking's own reservation, settle the
-        escrowed fare to the provider, then mint loyalty to the CUSTOMER
-        who made the booking (not the caller).
-
-        Verification runs inside a prompt_non_comparative consensus block,
-        so validators independently query the provider (with the owner-set
-        bearer token) and independently confirm the response references this
-        booking's reservation_ref — a generic page or an unauthenticated
-        "yes" is not accepted as evidence. Owner-gated since it issues
-        value-bearing loyalty and moves escrowed funds.
-        """
-        self._only_owner()
-        raw = self.bookings.get(booking_id)
-        if raw is None:
-            raise gl.vm.UserError("unknown booking")
-        booking = json.loads(raw)
-        if booking["status"] != "confirmed" or booking["completion_verified"]:
-            raise gl.vm.UserError("booking not verifiable")
-        ref = booking.get("reservation_ref", "")
-        if not ref:
-            raise gl.vm.UserError("booking has no reservation reference on file")
-        if not self.provider_auth_token:
-            raise gl.vm.UserError("provider authentication not configured: owner must call set_provider_auth")
-        if self.provider_address == ADMIN_ZERO:
-            raise gl.vm.UserError("provider payout address not configured: owner must call set_provider")
-
-        feed = self.feed_base
-        token = self.provider_auth_token
-
-        def get_status() -> str:
-            """Deterministic completion verdict derived from the authenticated
-            evidence itself — no LLM judgment. The feed is owner-configured and
-            bearer-authenticated, and its JSON echoes the reservation ref plus
-            a lifecycle status, so "yes" requires: HTTP 200 + this exact ref +
-            status "completed". Anything else (401, unknown ref, cancelled,
-            still-confirmed) is "no".
-
-            This replaced an exec_prompt + prompt_non_comparative flow whose
-            validators judged the leader's answer against criteria WITHOUT
-            seeing the evidence — criteria said "answer no unless the ref is
-            present in the evidence", which blind validators conservatively
-            did, reverting every completion regardless of evidence quality."""
-            res = gl.nondet.web.get(
-                feed + "/status?ref=" + ref,
-                headers={"Authorization": "Bearer " + token},
-            )
-            if _http_status(res) != 200:
-                # auth failure or provider error is not evidence of anything
-                return "no"
-            try:
-                page = json.loads(res.body.decode("utf-8"))
-            except Exception:
-                return "no"
-            if not isinstance(page, dict):
-                return "no"
-            echoed_ref = str(page.get("ref", "")).strip().upper()
-            status = str(page.get("status", "")).strip().lower()
-            if echoed_ref == ref.strip().upper() and status == "completed":
-                return "yes"
-            return "no"
-
-        # strict_eq over a DERIVED value: every validator re-fetches the same
-        # authenticated URL and derives the same yes/no from byte-identical
-        # JSON (the server serves date-granular, deterministic bodies). No LLM
-        # in the loop, so no judgment drift between validators.
-        verdict = gl.eq_principle.strict_eq(get_status)
-        if str(verdict).strip().lower() != "yes":
-            raise gl.vm.UserError("trip completion not verified")
-
-        booking["status"] = "completed"
-        booking["completion_verified"] = True
-
-        # Settlement path: the escrowed fare goes to the carrier/agency now
-        # that verified, authenticated completion evidence exists. Guarded
-        # so a booking is never settled twice.
-        if not booking.get("settled"):
-            price = u256(booking["price_wei"])
-            _Payee(self.provider_address).emit_transfer(value=price)
-            booking["settled"] = True
-            booking["settled_wei"] = int(price)
-
-        self.bookings[booking_id] = json.dumps(booking)
-
-        customer = Address(booking["customer"])
-        self.loyalty[customer] = self.loyalty.get(customer, u256(0)) + LOYALTY_PER_BOOKING
-
-    # -- Disputes ------------------------------------------------------------
-
-    @gl.public.write
-    def file_dispute(self, booking_id: str, reason: str) -> str:
-        """File an AI-adjudicated dispute. Rate-limited per address."""
-        self._unpaused()
-        sender = gl.message.sender_address
-        now = self._current_time()
-        last = self.last_dispute_time.get(sender, u256(0))
-        if last > u256(0) and (now - last) < u256(DISPUTE_INTERVAL_SECONDS):
-            raise gl.vm.UserError("dispute rate limit: try again later")
-
-        raw = self.bookings.get(booking_id)
-        if raw is None:
-            raise gl.vm.UserError("unknown booking")
-        booking = json.loads(raw)
-        if str(sender) != booking["customer"]:
-            raise gl.vm.UserError("only the booking customer may file a dispute")
-        if booking["status"] != "confirmed":
-            # Once a booking is "completed" it has already been settled in
-            # full to the provider (confirm_completion), and "disputed" /
-            # "resolved" bookings have already gone through escalate()'s
-            # settlement. There is no escrow left to split once either
-            # settlement path has run, so a dispute can only be opened
-            # against a still-escrowed, unsettled booking.
-            raise gl.vm.UserError("booking is not open to dispute (already completed, disputed, or resolved)")
-        if not isinstance(reason, str) or len(reason) < 10 or len(reason) > 500:
-            raise gl.vm.UserError("invalid dispute reason")
-
-        booking["status"] = "disputed"
-        self.bookings[booking_id] = json.dumps(booking)
-
-        self.last_dispute_time[sender] = now
-
-        dispute_id = booking_id + "-" + str(sender)
-        dispute_record = {
-            "booking_id": booking_id,
-            "claimant": str(sender),
-            "reason": reason,
-            "status": "pending",
-            "rounds": 0,
-            "refund_wei": 0,
-            "paid_out": False,
-        }
-        self.disputes[dispute_id] = json.dumps(dispute_record)
-        return dispute_id
-
-    @gl.public.write
-    def escalate(self, dispute_id: str, refund_floor_hint: u256) -> u256:
-        """Produce the AI adjudication for a dispute and settle BOTH legs:
-        the refund to the customer and the non-refunded remainder to the
-        carrier/agency.
-
-        Validators weigh the dispute reason against AUTHENTICATED provider
-        evidence tied to the booking's own reservation_ref via a
-        prompt_comparative consensus block, settle on a refund in wei capped
-        at the booking price. The dispute["status"] == "ruled" guard below
-        is unconditional (not paid_out-dependent), so this cannot be replayed
-        even when the ruling is a zero refund. refund_floor_hint is only a
-        hint; consensus decides the number.
-        """
-        raw_dispute = self.disputes.get(dispute_id)
-        if raw_dispute is None:
-            raise gl.vm.UserError("unknown dispute")
-        dispute = json.loads(raw_dispute)
-        if dispute["status"] == "ruled":
-            raise gl.vm.UserError("dispute already settled")
-
-        raw_booking = self.bookings.get(dispute["booking_id"])
-        if raw_booking is None:
-            raise gl.vm.UserError("booking not found")
-        booking = json.loads(raw_booking)
-
-        ref = booking.get("reservation_ref", "")
-        if not ref:
-            raise gl.vm.UserError("booking has no reservation reference on file")
-        if not self.provider_auth_token:
-            raise gl.vm.UserError("provider authentication not configured: owner must call set_provider_auth")
-        if self.provider_address == ADMIN_ZERO:
-            raise gl.vm.UserError("provider payout address not configured: owner must call set_provider")
-
-        dispute["rounds"] = dispute["rounds"] + 1
-        price_max = u256(booking["price_wei"])
-        reason = str(dispute["reason"])
-
-        # Same nondet-storage rule as refresh_quote/confirm_completion: capture
-        # the feed root before the closure instead of reading storage inside it.
-        feed = self.feed_base
-        token = self.provider_auth_token
-
-        def get_ruling() -> str:
-            try:
-                res = gl.nondet.web.get(
-                    feed + "/status?ref=" + ref,
-                    headers={"Authorization": "Bearer " + token},
-                )
-                if _http_status(res) != 200:
-                    evidence = "provider evidence unavailable (auth/status error)"
-                else:
-                    evidence = res.body.decode("utf-8")[:2000]
-            except Exception:
-                evidence = "provider status unavailable"
-            return gl.nondet.exec_prompt(
-                "Travity travel dispute for reservation " + ref + ". Reason: " + reason +
-                ". Booking price (wei): " + str(price_max) +
-                ". Authenticated provider evidence: " + evidence +
-                ". If the evidence does not reference reservation " + ref +
-                " or is unavailable, award the full booking price as refund. "
-                "Otherwise decide a fair refund in integer wei from 0 to " +
-                str(price_max) + ". Reply only with the number."
-            )
-
-        agreed = gl.eq_principle.prompt_comparative(
-            get_ruling,
-            "The two values are the same refund amount in wei, allowing "
-            "up to 10% difference given the judgment call involved.",
-        )
-        try:
-            refund = u256(int(str(agreed).strip()))
-        except Exception:
-            refund = u256(0)
-        if refund > price_max:
-            refund = price_max
-
-        dispute["status"] = "ruled"
-        dispute["refund_wei"] = int(refund)
-
-        # -- Settlement: the customer's refund leg and the provider's
-        # remainder leg both happen here, once, guarded by the unconditional
-        # "already ruled" check above.
-        if refund > u256(0):
-            claimant = Address(dispute["claimant"])
-            # Confirmed against docs.genlayer.com/.../features/value-transfers:
-            # sending GEN to an EOA is an external message, done through an
-            # @gl.evm.contract_interface proxy's emit_transfer(value=...).
-            # There is no bare gl.emit_transfer() — that was an unverified guess.
-            _Payee(claimant).emit_transfer(value=refund)
-            dispute["paid_out"] = True
-
-        remainder = price_max - refund
-        if remainder > u256(0):
-            _Payee(self.provider_address).emit_transfer(value=remainder)
-
-        booking["settled"] = True
-        booking["settled_wei"] = int(remainder)
-        booking["status"] = "resolved"
-        self.bookings[dispute["booking_id"]] = json.dumps(booking)
-        self.disputes[dispute_id] = json.dumps(dispute)
-
-        return refund
-
-    @gl.public.view
-    def view_dispute(self, dispute_id: str) -> dict:
-        raw = self.disputes.get(dispute_id)
-        if raw is None:
-            return {}
-        d = json.loads(raw)
-        return {
-            "booking_id": d["booking_id"],
-            "status": d["status"],
-            "rounds": int(d["rounds"]),
-            "refund_wei": int(d.get("refund_wei", 0)),
-            "paid_out": bool(d.get("paid_out", False)),
-        }
-
-    @gl.public.view
-    def balance_of(self, who: Address) -> u256:
-        return self.loyalty.get(who, u256(0))
+#!/usr/bin/env node
+/**
+ * Travity quote server.
+ *
+ * - POST/GET /api/quote : rate-limited flight search converted USD -> GEN
+ *   (wei) using a cached GEN/USD rate. Fares come from ONE provider, chosen
+ *   explicitly via QUOTE_PROVIDER: `rapid` (RapidAPI google-flights2, real
+ *   Google Flights fares), `kiwi` (Kiwi.com Tequila) or `omkarcloud`
+ *   (OmkarCloud Expedia Scraper). No fallback chain, no demo feed.
+ * - GET /quote          : plain-JSON alias a GenLayer contract leader can
+ *   fetch from `quote_feed`. Same handler, no date param defaults.
+ * - POST /api/reserve   : issues a real reservation (PNR) before escrow. The
+ *   on-chain book() stores this ref; it is the anchor confirm_completion /
+ *   escalate verify against /status evidence.
+ * - GET /status         : authenticated completion evidence for the contract's
+ *   confirm_completion / escalate consensus blocks. Requires
+ *   Authorization: Bearer AGENCY_AUTH_TOKEN (the on-chain provider_auth_token)
+ *   and a reservation ref that /api/reserve actually issued; unknown refs 404.
+ *
+ * NO MOCK: with no configured provider it returns 503 rather than fabricating
+ * a price. Without a usable GEN price (GEN_USD_RATE or CoinGecko) it returns
+ * 503 too.
+ *
+ * Security notes:
+ * - Secrets never leave this process; the browser only ever sees the rounded
+ *   price and metadata.
+ * - Per-IP rate limiting via express-rate-limit (QUOTE_PROXY_RATE_LIMIT).
+ * - Our own quote cache absorbs repeated route/date lookups.
+ */
+import "dotenv/config";
+import express from "express";
+import rateLimit from "express-rate-limit";
+import fs from "node:fs";
+import path from "node:path";
+
+const PORT = Number(process.env.PORT || 8080);
+const OMKAR = {
+  host: process.env.OMKAR_BASE_URL || "https://expedia-scraper.omkar.cloud",
+  apiKey: process.env.OMKAR_API_KEY || "",
+};
+const KIWI = {
+  host: process.env.KIWI_BASE_URL || "https://tequila-api.kiwi.com",
+  apiKey: process.env.KIWI_API_KEY || "",
+};
+const RAPID = {
+  host: process.env.RAPID_API_HOST || "google-flights2.p.rapidapi.com",
+  apiKey: process.env.RAPID_API_KEY || "",
+};
+// Exactly one provider. `rapid` uses RapidAPI google-flights2 (real Google
+// Flights fares); `kiwi` uses Kiwi.com Tequila; `omkarcloud` uses the
+// OmkarCloud Expedia scraper. Anything else is rejected at boot.
+const QUOTE_PROVIDER = String(process.env.QUOTE_PROVIDER || "rapid").toLowerCase();
+if (!["rapid", "kiwi", "omkarcloud"].includes(QUOTE_PROVIDER)) {
+  throw new Error(`QUOTE_PROVIDER must be one of 'rapid'|'kiwi'|'omkarcloud', got '${QUOTE_PROVIDER}'`);
+}
+const ACTIVE = QUOTE_PROVIDER === "rapid" ? RAPID : QUOTE_PROVIDER === "kiwi" ? KIWI : OMKAR;
+const ACTIVE_KEY_ENV =
+  QUOTE_PROVIDER === "rapid" ? "RAPID_API_KEY" : QUOTE_PROVIDER === "kiwi" ? "KIWI_API_KEY" : "OMKAR_API_KEY";
+if (!ACTIVE.apiKey) {
+  console.error(`[quote-server] WARNING: ${ACTIVE_KEY_ENV} is empty; quotes will 503.`);
+}
+const WEI_PER_GEN = 10n ** 18n;
+const QUOTE_TTL_MS = Number(process.env.QUOTE_TTL_MS || 30 * 60 * 1000);
+const GEN_TTL_MS = Number(process.env.GEN_TTL_MS || 5 * 60 * 1000);
+const RATE_LIMIT = Number(process.env.QUOTE_PROXY_RATE_LIMIT || 30);
+// Carrier/agency bearer token the contract uses for AUTHENTICATED /status
+// reads (set on-chain by the owner via set_provider_auth()). The /status feed
+// only answers with this token, so a spoofed/unauthenticated page fetch is not
+// accepted as completion/dispute evidence by validators.
+const AGENCY_AUTH_TOKEN = String(process.env.AGENCY_AUTH_TOKEN || "").trim();
+// After the upstream proves itself down (5xx/network/429), skip further
+// upstream calls for this window instead of hot-looping a dead provider.
+const OUTAGE_COOLDOWN_MS = Number(process.env.OUTAGE_COOLDOWN_MS || 30 * 1000);
+// Max age of a last-known-good quote we will still serve (marked `stale`)
+// when the live provider is unavailable. Real prices only ever come from an
+// actual upstream response; stale only means "not freshly fetched".
+const QUOTE_STALE_MAX_MS = Number(process.env.QUOTE_STALE_MAX_MS || 7 * 24 * 60 * 60 * 1000);
+
+const cache = { genUsd: null, quotes: new Map(), reservations: new Map() };
+
+// Reservations MUST survive process restarts: confirm_completion/escalate on
+// the contract can be called weeks after booking, and an in-memory-only Map
+// loses every reservation on any restart/redeploy (Render free tier spins
+// down on inactivity; Railway restarts on deploys/maintenance). A wiped
+// reservation makes /status 404 forever, which the contract correctly reads
+// as "not completed" — permanently, with no way to fix it from the contract
+// side. Persist to a JSON file on disk and reload it at boot.
+const RESERVATIONS_FILE = process.env.RESERVATIONS_FILE || path.join(process.cwd(), "data", "reservations.json");
+
+function loadReservations() {
+  try {
+    const raw = fs.readFileSync(RESERVATIONS_FILE, "utf8");
+    const obj = JSON.parse(raw);
+    for (const [ref, rec] of Object.entries(obj)) {
+      cache.reservations.set(ref, rec);
+    }
+    console.log(`[quote-server] loaded ${cache.reservations.size} reservation(s) from ${RESERVATIONS_FILE}`);
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      console.error(`[quote-server] WARNING: failed to load ${RESERVATIONS_FILE}: ${err.message}`);
+    }
+  }
+}
+
+function saveReservations() {
+  try {
+    fs.mkdirSync(path.dirname(RESERVATIONS_FILE), { recursive: true });
+    const obj = Object.fromEntries(cache.reservations);
+    // Atomic write: write to a temp file then rename, so a crash mid-write
+    // never corrupts/truncates the persisted file.
+    const tmp = `${RESERVATIONS_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(obj), "utf8");
+    fs.renameSync(tmp, RESERVATIONS_FILE);
+  } catch (err) {
+    console.error(`[quote-server] WARNING: failed to persist reservations: ${err.message}`);
+  }
+}
+
+loadReservations();
+
+// PNRs are 6-char IATA-style alphanumerics (excluding lookalike chars).
+const PNR_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+function newPnr() {
+  let pnr = "";
+  const rand = new Uint32Array(1);
+  for (let i = 0; i < 6; i++) {
+    crypto.getRandomValues(rand);
+    pnr += PNR_ALPHABET[rand[0] % PNR_ALPHABET.length];
+  }
+  // Collision guard: extremely unlikely, but keep trying for uniqueness.
+  if (cache.reservations.has(pnr)) return newPnr();
+  return pnr;
+}
+
+class ApiError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+// Transient upstream failure (network, 5xx, 429): may heal, so it arms the
+// outage cooldown and can trigger the stale-cache fallback. Deterministic
+// failures (401 key, other 4xx, missing quotes) stay plain ApiError and never
+// masquerade as a provider outage.
+class TransientError extends ApiError {
+  constructor(status, message) {
+    super(status, message);
+    this.transient = true;
+  }
+}
+
+const IATA_RE = /^[A-Za-z]{3}$/;
+
+function toIsoDate(yyyymmdd, fallbackOffsetDays) {
+  if (!yyyymmdd) {
+    const d = new Date(Date.now() + fallbackOffsetDays * 86400000);
+    return d.toISOString().slice(0, 10);
+  }
+  const s = String(yyyymmdd).trim();
+  if (!/^\d{8}$/.test(s)) throw new ApiError(400, "dates must be YYYYMMDD");
+  const iso = `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+  if (Number.isNaN(Date.parse(iso))) throw new ApiError(400, "invalid date");
+  return iso;
+}
+
+function parseUsdPrice(raw) {
+  if (typeof raw !== "string") return null;
+  const m = raw.replace(/[^0-9.,]/g, "").replace(/,/g, "").match(/\d+(\.\d+)?/);
+  const v = m ? Number(m[0]) : Number.NaN;
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
+// The OmkarCloud upstream is intermittently flaky (transient 4xx/5xx, dropped
+// connections) while still returning healthy quotes on retries. Retry transient
+// errors with short backoff; only give up after exhausting attempts, and then
+// say WHY so the UI shows something actionable instead of a bare status code.
+const UPSTREAM_ATTEMPTS = 3;                 // initial call + 2 retries
+const UPSTREAM_RETRY_DELAY_MS = [500, 1000]; // backoff per retry attempt
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function upstreamErrorDetail(res) {
+  try {
+    const text = (await res.text()).trim().slice(0, 200);
+    return text || null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchExpediaQuote({ origin, destination, depart }) {
+  if (!OMKAR.apiKey) {
+    throw new ApiError(503, "OMKAR_API_KEY not configured. Add it to server/.env, then restart.");
+  }
+  const params = new URLSearchParams({
+    departure_airport_code: origin,
+    arrival_airport_code: destination,
+    departure_date: depart,
+    cabin_class: "coach",
+  });
+  const url = `${OMKAR.host}/expedia/flights/one-way?${params}`;
+  const headers = { "API-Key": OMKAR.apiKey, Accept: "application/json" };
+
+  let res = null;
+  let networkErr = null;
+  for (let attempt = 0; attempt < UPSTREAM_ATTEMPTS; attempt++) {
+    try {
+      res = await fetch(url, { headers, signal: AbortSignal.timeout(20_000) });
+      networkErr = null;
+    } catch (err) {
+      res = null;
+      networkErr = err.message;
+    }
+
+    if (res) {
+      if (res.status === 401) {
+        // Deterministic: a bad key never heals on retry.
+        throw new ApiError(502, "Expedia API rejected the key (401). Check OMKAR_API_KEY in server/.env.");
+      }
+      if (res.ok) break;
+      if (res.status < 500 && res.status !== 429) {
+        // Other 4xx: a deterministic provider rejection (bad route/date/quota).
+        const detail = await upstreamErrorDetail(res);
+        throw new ApiError(
+          502,
+          `Expedia flight search failed (${res.status}${detail ? `: ${detail}` : ""}). ` +
+            "Try a different route or dates, or check the API key quota."
+        );
+      }
+      // else 5xx or 429: transient — fall through to retry/backoff below.
+    }
+
+    if (attempt < UPSTREAM_ATTEMPTS - 1) {
+      await sleep(UPSTREAM_RETRY_DELAY_MS[attempt] ?? 750);
+      continue;
+    }
+
+    if (networkErr) {
+      throw new TransientError(502, `Expedia API unreachable after ${UPSTREAM_ATTEMPTS} attempts: ${networkErr}`);
+    }
+    const detail = res ? await upstreamErrorDetail(res) : null;
+    const status = res?.status === 429 ? 429 : 502;
+    throw new TransientError(
+      status,
+      `Expedia API temporarily unavailable after ${UPSTREAM_ATTEMPTS} attempts (${res?.status ?? "network"}${detail ? `: ${detail}` : ""}). Try again in a moment.`
+    );
+  }
+
+  const j = await res.json();
+  const flights = Array.isArray(j.flights) ? j.flights : [];
+  if (!flights.length) throw new ApiError(404, "No quotes from provider for this route/date.");
+
+  let best = null;
+  for (const f of flights) {
+    const fare = f.fare_options?.[0];
+    const price = parseUsdPrice(fare?.price_detail) ?? parseUsdPrice(fare?.display_price) ?? parseUsdPrice(f?.starting_price);
+    if (price == null) continue;
+    if (best == null || price < best.price) best = { price, f };
+  }
+  if (!best) throw new ApiError(404, "No priced quotes from provider for this route/date.");
+
+  return {
+    usdTotal: best.price,
+    usdCurrency: "USD",
+    carrier: best.f.airlines?.[0]?.name || "",
+  };
+}
+
+async function fetchKiwiFare({ origin, destination, depart }) {
+  if (!KIWI.apiKey) {
+    throw new ApiError(503, "KIWI_API_KEY not configured. Add it to server/.env, then restart.");
+  }
+  // Kiwi dates are DD/MM/YYYY and `date_from`..`date_to` is a ranged window;
+  // a single-day search uses the same date for both ends.
+  const dmy = (iso) => iso.replaceAll("-", "/").split("/").reverse().join("/");
+  const d = dmy(depart);
+  const params = new URLSearchParams({
+    fly_from: origin,
+    fly_to: destination,
+    date_from: d,
+    date_to: d,
+    adults: "1",
+    curr: "USD",
+    max_stopovers: "2",
+    limit: "10",
+  });
+  const url = `${KIWI.host}/v2/search?${params}`;
+  const headers = { apikey: KIWI.apiKey, Accept: "application/json" };
+
+  let res = null;
+  let networkErr = null;
+  for (let attempt = 0; attempt < UPSTREAM_ATTEMPTS; attempt++) {
+    try {
+      res = await fetch(url, { headers, signal: AbortSignal.timeout(20_000) });
+      networkErr = null;
+    } catch (err) {
+      res = null;
+      networkErr = err.message;
+    }
+
+    if (res) {
+      if (res.status === 401) {
+        // Deterministic: a bad key never heals on retry.
+        throw new ApiError(502, "Kiwi rejected the key (401). Check KIWI_API_KEY in server/.env.");
+      }
+      if (res.ok) break;
+      if (res.status < 500 && res.status !== 429) {
+        const detail = await upstreamErrorDetail(res);
+        throw new ApiError(
+          502,
+          `Kiwi flight search failed (${res.status}${detail ? `: ${detail}` : ""}). ` +
+            "Try a different route or dates, or check the API key quota."
+        );
+      }
+      // else 5xx or 429: transient — fall through to retry/backoff below.
+    }
+
+    if (attempt < UPSTREAM_ATTEMPTS - 1) {
+      await sleep(UPSTREAM_RETRY_DELAY_MS[attempt] ?? 750);
+      continue;
+    }
+
+    if (networkErr) {
+      throw new TransientError(502, `Kiwi API unreachable after ${UPSTREAM_ATTEMPTS} attempts: ${networkErr}`);
+    }
+    const detail = res ? await upstreamErrorDetail(res) : null;
+    const status = res?.status === 429 ? 429 : 502;
+    throw new TransientError(
+      status,
+      `Kiwi API temporarily unavailable after ${UPSTREAM_ATTEMPTS} attempts (${res?.status ?? "network"}${detail ? `: ${detail}` : ""}). Try again in a moment.`
+    );
+  }
+
+  const j = await res.json();
+  const offers = Array.isArray(j.data) ? j.data : [];
+  let best = null;
+  for (const o of offers) {
+    const price = Number(o.price);
+    if (!Number.isFinite(price) || price <= 0) continue;
+    if (best == null || price < best.price) best = { price, o };
+  }
+  if (!best) throw new ApiError(404, "No priced Kiwi quotes for this route/date.");
+
+  const a = best.o.airlines?.[0];
+  return {
+    usdTotal: best.price,
+    usdCurrency: "USD",
+    carrier: typeof a === "string" ? a : "",
+  };
+}
+
+async function fetchRapidFare({ origin, destination, depart }) {
+  if (!RAPID.apiKey) {
+    throw new ApiError(503, "RAPID_API_KEY not configured. Add it to server/.env, then restart.");
+  }
+  const params = new URLSearchParams({
+    departure_id: origin,
+    arrival_id: destination,
+    outbound_date: depart, // YYYY-MM-DD (ISO from toIsoDate)
+    adults: "1",
+    travel_class: "ECONOMY",
+    currency: "USD",
+  });
+  const url = `https://${RAPID.host}/api/v1/searchFlights?${params}`;
+  const headers = { "X-RapidAPI-Key": RAPID.apiKey, "X-RapidAPI-Host": RAPID.host, Accept: "application/json" };
+
+  let res = null;
+  let networkErr = null;
+  for (let attempt = 0; attempt < UPSTREAM_ATTEMPTS; attempt++) {
+    try {
+      res = await fetch(url, { headers, signal: AbortSignal.timeout(20_000) });
+      networkErr = null;
+    } catch (err) {
+      res = null;
+      networkErr = err.message;
+    }
+
+    if (res) {
+      if (res.status === 401 || res.status === 403) {
+        // Deterministic: a bad key never heals on retry.
+        throw new ApiError(502, "RapidAPI rejected the key (401/403). Check RAPID_API_KEY in server/.env.");
+      }
+      if (res.ok) break;
+      if (res.status < 500 && res.status !== 429) {
+        const detail = await upstreamErrorDetail(res);
+        throw new ApiError(
+          502,
+          `RapidAPI google-flights2 search failed (${res.status}${detail ? `: ${detail}` : ""}). ` +
+            "Try a different route or dates, or check the subscription/quota."
+        );
+      }
+      // else 5xx or 429: transient — fall through to retry/backoff below.
+    }
+
+    if (attempt < UPSTREAM_ATTEMPTS - 1) {
+      await sleep(UPSTREAM_RETRY_DELAY_MS[attempt] ?? 750);
+      continue;
+    }
+
+    if (networkErr) {
+      throw new TransientError(502, `RapidAPI unreachable after ${UPSTREAM_ATTEMPTS} attempts: ${networkErr}`);
+    }
+    const detail = res ? await upstreamErrorDetail(res) : null;
+    const status = res?.status === 429 ? 429 : 502;
+    throw new TransientError(
+      status,
+      `RapidAPI temporarily unavailable after ${UPSTREAM_ATTEMPTS} attempts (${res?.status ?? "network"}${detail ? `: ${detail}` : ""}). Try again in a moment.`
+    );
+  }
+
+  const j = await res.json();
+  const topFlights = j?.data?.itineraries?.topFlights ?? j?.data?.itineraries?.flights ?? [];
+  let best = null;
+  for (const f of topFlights) {
+    const price = Number(f.price);
+    if (!Number.isFinite(price) || price <= 0) continue;
+    if (best == null || price < best.price) best = { price, f };
+  }
+  if (!best) throw new ApiError(404, "No priced RapidAPI quotes for this route/date.");
+
+  return {
+    usdTotal: best.price,
+    usdCurrency: "USD",
+    carrier: Array.isArray(best.f.airlines) ? best.f.airlines.join("/") : String(best.f.airlines || ""),
+  };
+}
+
+async function fetchFare({ origin, destination, depart }) {
+  if (QUOTE_PROVIDER === "rapid") {
+    const fare = await fetchRapidFare({ origin, destination, depart });
+    return { ...fare, provider: "rapid" };
+  }
+  if (QUOTE_PROVIDER === "kiwi") {
+    const fare = await fetchKiwiFare({ origin, destination, depart });
+    return { ...fare, provider: "kiwi" };
+  }
+  const fare = await fetchExpediaQuote({ origin, destination, depart });
+  return { ...fare, provider: "omkarcloud" };
+}
+
+async function getGenUsdRate() {
+  if (cache.genUsd && Date.now() < cache.genUsd.fetchedAt + GEN_TTL_MS) {
+    return cache.genUsd.rate;
+  }
+  const configured = Number(process.env.GEN_USD_RATE);
+  if (Number.isFinite(configured) && configured > 0) {
+    cache.genUsd = { rate: configured, fetchedAt: Date.now() };
+    return configured;
+  }
+  const ids = (process.env.COINGECKO_TOKEN_IDS || "genlayer")
+    .split(",").map((s) => s.trim()).filter(Boolean);
+  for (const id of ids.slice(0, 5)) {
+    try {
+      const url = `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}&vs_currencies=usd`;
+      const j = await (await fetch(url, { signal: AbortSignal.timeout(8000) })).json();
+      const v = Number(j?.[id]?.usd);
+      if (Number.isFinite(v) && v > 0) {
+        cache.genUsd = { rate: v, fetchedAt: Date.now() };
+        return v;
+      }
+    } catch {
+      /* try next id */
+    }
+  }
+  throw new ApiError(503, "GEN/USD price unavailable. Set GEN_USD_RATE in server/.env or a CoinGecko token id via COINGECKO_TOKEN_IDS.");
+}
+
+async function buildQuote(origin, destination, depart, ret) {
+  const key = `${origin}-${destination}-${depart}-${ret || ""}`;
+  const hit = cache.quotes.get(key);
+  if (hit && Date.now() < hit.ts + QUOTE_TTL_MS) return hit.value;
+
+  const now = Date.now();
+
+  // Circuit breaker: while the upstream is in a cooldown window after
+  // consecutive failures, don't hot-loop a dead provider. Serve a recent
+  // last-known-good price if we have one; otherwise fail fast and clearly.
+  if (now < (cache.outageUntil || 0)) {
+    const stale = cache.quotes.get(key);
+    if (stale && now < stale.ts + QUOTE_STALE_MAX_MS) {
+      return { ...stale.value, stale: true, stale_age_s: Math.round((now - stale.ts) / 1000) };
+    }
+    throw new ApiError(
+      503,
+      "Flight price provider is currently in an outage (persistent server errors). " +
+        "The live price will recover automatically once the provider is back. " +
+        "Please try again in a moment."
+    );
+  }
+
+  // Fare provider(s) cover the outbound leg; ret is validated but not
+  // used for pricing.
+  try {
+    const fare = await fetchFare({ origin, destination, depart });
+    const { usdTotal, usdCurrency, carrier, provider } = fare;
+    const rate = await getGenUsdRate();
+
+    // USD -> GEN (wei). 1 GEN = 10^18 wei. priceWei = (usd / rate) * 10^18.
+    const priceWei = BigInt(Math.round((usdTotal / rate) * 1e18));
+
+    const value = {
+      route: `${origin}-${destination}`,
+      currency: "GEN",
+      price_wei: priceWei.toString(),
+      usd_total: usdTotal,
+      usd_currency: usdCurrency,
+      rate_usd_per_gen: rate,
+      carrier,
+      provider,
+    };
+    cache.quotes.set(key, { ts: Date.now(), value });
+    cache.outageUntil = 0; // upstream healthy again — clear any cooldown
+    return value;
+  } catch (err) {
+    if (err instanceof TransientError) {
+      // Persistent outage detected — cool down so the next attempts skip the
+      // upstream and instantly hit the clear message / stale fallback above.
+      cache.outageUntil = Date.now() + OUTAGE_COOLDOWN_MS;
+    }
+    // Provider down but we have a real, previously-fetched price for this
+    // route/dates: serve it clearly marked stale instead of a hard failure.
+    const stale = cache.quotes.get(key);
+    if (stale && now < stale.ts + QUOTE_STALE_MAX_MS) {
+      return { ...stale.value, stale: true, stale_age_s: Math.round((now - stale.ts) / 1000) };
+    }
+    throw err;
+  }
+}
+
+const app = express();
+app.disable("x-powered-by");
+app.use(express.json({ limit: "16kb" }));
+
+// Browser clients on another origin (e.g. the deployed frontend / Vite dev)
+// must be allowed to call this API. GET-only, so a permissive CORS policy is fine.
+app.use((req, res, next) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type, Accept");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+const quoteLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: RATE_LIMIT,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) =>
+    res.status(429).json({ error: "Rate limit exceeded. Try again shortly." }),
+});
+
+function parseRoute(req) {
+  const from = String(req.query.from || "").trim().toUpperCase();
+  const to = String(req.query.to || "").trim().toUpperCase();
+  if (!IATA_RE.test(from) || !IATA_RE.test(to) || from === to) {
+    throw new ApiError(400, "route must be two distinct 3-letter IATA codes (e.g. from=JFK&to=LHR)");
+  }
+  const depart = toIsoDate(req.query.depart, 14);
+  const ret = toIsoDate(req.query.ret, 21);
+  if (depart >= ret) throw new ApiError(400, "return date must be after departure date");
+  return { from, to, depart, ret };
+}
+
+function quoteEndpoint(req, res, next) {
+  try {
+    const { from, to, depart, ret } = parseRoute(req);
+    buildQuote(from, to, depart, ret)
+      .then((v) => res.json(v))
+      .catch(next);
+  } catch (err) {
+    next(err);
+  }
+}
+
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    provider: QUOTE_PROVIDER,
+    rapid: { configured: Boolean(RAPID.apiKey) },
+    kiwi: { configured: Boolean(KIWI.apiKey) },
+    omkar: { configured: Boolean(OMKAR.apiKey) },
+    outage: Boolean(cache.outageUntil && Date.now() < cache.outageUntil),
+    outage_until_ms: cache.outageUntil || null,
+    agency_auth: { configured: Boolean(AGENCY_AUTH_TOKEN) },
+  });
+});
+app.get("/api/quote", quoteLimiter, quoteEndpoint);
+app.get("/quote", quoteLimiter, quoteEndpoint);
+
+// Reservation issue + authenticated completion evidence for the contract's
+// confirm_completion / escalate non-deterministic blocks, which GET
+// `feed_base + "/status?ref=" + reservation_ref` with
+// `Authorization: Bearer <token>`.
+//
+// The contract only accepts evidence that is (a) authenticated with the
+// owner-configured bearer token (set_provider_auth) — a spoofed/blank request
+// gets 401 — and (b) tied to a reservation this server actually issued via
+// POST /api/reserve. Unknown refs return 404, so a made-up PNR is never
+// accepted as evidence of completion.
+
+// A confirmed reservation whose return date has passed is completed. The
+// comparison is date-granular (UTC calendar day, not timestamp) so every
+// validator fetching evidence on the same day reads byte-identical bodies —
+// consensus-safe. Explicit overrides ("completed"/"cancelled") always win.
+function effectiveStatus(reservation) {
+  if (reservation.status !== "confirmed") return reservation.status;
+  const today = new Date().toISOString().slice(0, 10);
+  return today > reservation.ret ? "completed" : "confirmed";
+}
+
+app.get("/status", (req, res) => {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  if (!AGENCY_AUTH_TOKEN || token !== AGENCY_AUTH_TOKEN) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const ref = String(req.query.ref || "").trim().toUpperCase();
+  if (!ref || !/^[A-Z0-9]{4,12}$/.test(ref)) {
+    return res.status(400).json({ error: "invalid reservation ref" });
+  }
+  const reservation = cache.reservations.get(ref);
+  if (!reservation) {
+    return res.status(404).json({ error: "unknown reservation" });
+  }
+  // Deterministic evidence body: same bytes for every validator, and it
+  // certifies the specific PNR exists with a concrete completion state.
+  return res.json({
+    ref: reservation.ref,
+    route: reservation.route,
+    status: effectiveStatus(reservation), // "confirmed" | "completed" | "cancelled"
+    updated_at: reservation.updatedAt,
+  });
+});
+
+// Issue a real reservation (PNR). The frontend POSTs here after a quote and
+// before escrowing on-chain; `book()` on the contract stores the returned ref.
+// Rate-limited to prevent PNR spam. In a production integration this call
+// would go through the carrier/agency booking API instead of being issued
+// directly; the invariant that matters for the contract is that the PNR is
+// issued server-side and is verifiable later via authenticated /status.
+const reserveLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) => res.status(429).json({ error: "Too many reservations. Try again shortly." }),
+});
+
+app.post("/api/reserve", reserveLimiter, (req, res) => {
+  const from = String(req.body?.from || "").trim().toUpperCase();
+  const to = String(req.body?.to || "").trim().toUpperCase();
+  const depart = String(req.body?.depart || "").trim();
+  const ret = String(req.body?.ret || "").trim();
+  try {
+    const { from: f, to: t, depart: d, ret: r } = parseRoute({ query: { from, to, depart, ret } });
+    const pnr = newPnr();
+    cache.reservations.set(pnr, {
+      ref: pnr,
+      route: `${f}-${t}`,
+      depart: d,
+      ret: r,
+      status: "confirmed",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    saveReservations();
+    return res.status(201).json({ ref: pnr, route: `${f}-${t}`, status: "confirmed" });
+  } catch (err) {
+    const status = err instanceof ApiError ? err.status : 400;
+    return res.status(status).json({ error: err.message || "invalid reservation request" });
+  }
+});
+
+// Operator override of a reservation's lifecycle state — the carrier/agency
+// action a real integration would expose. Authenticated with the same bearer
+// token the contract uses for /status reads, so only someone holding
+// AGENCY_AUTH_TOKEN can flip states. "completed" lets a trip settle before
+// its return date (testing/ops); "cancelled" exercises the dispute-refund
+// path. Rate-limited like /api/reserve.
+const statusLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) => res.status(429).json({ error: "Too many status updates. Try again shortly." }),
+});
+
+app.post("/api/reservations/:ref/status", statusLimiter, (req, res) => {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  if (!AGENCY_AUTH_TOKEN || token !== AGENCY_AUTH_TOKEN) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const ref = String(req.params.ref || "").trim().toUpperCase();
+  if (!ref || !/^[A-Z0-9]{4,12}$/.test(ref)) {
+    return res.status(400).json({ error: "invalid reservation ref" });
+  }
+  const reservation = cache.reservations.get(ref);
+  if (!reservation) {
+    return res.status(404).json({ error: "unknown reservation" });
+  }
+  const status = String(req.body?.status || "").trim().toLowerCase();
+  if (!["completed", "cancelled"].includes(status)) {
+    return res.status(400).json({ error: "status must be 'completed' or 'cancelled'" });
+  }
+  reservation.status = status;
+  reservation.updatedAt = Date.now();
+  saveReservations();
+  return res.json({ ref: reservation.ref, status });
+});
+
+app.use((err, _req, res, _next) => {
+  const status = err instanceof ApiError ? err.status : 500;
+  if (status >= 500) console.error("[quote-server]", err.message);
+  res.status(status).json({ error: err.message || "internal error" });
+});
+
+app.listen(PORT, () => {
+  console.log(`[quote-server] listening on :${PORT} (provider=${QUOTE_PROVIDER}, host=${ACTIVE.host})`);
+});
