@@ -559,6 +559,17 @@ app.get("/quote", quoteLimiter, quoteEndpoint);
 // gets 401 — and (b) tied to a reservation this server actually issued via
 // POST /api/reserve. Unknown refs return 404, so a made-up PNR is never
 // accepted as evidence of completion.
+
+// A confirmed reservation whose return date has passed is completed. The
+// comparison is date-granular (UTC calendar day, not timestamp) so every
+// validator fetching evidence on the same day reads byte-identical bodies —
+// consensus-safe. Explicit overrides ("completed"/"cancelled") always win.
+function effectiveStatus(reservation) {
+  if (reservation.status !== "confirmed") return reservation.status;
+  const today = new Date().toISOString().slice(0, 10);
+  return today > reservation.ret ? "completed" : "confirmed";
+}
+
 app.get("/status", (req, res) => {
   const auth = req.headers.authorization || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
@@ -578,7 +589,7 @@ app.get("/status", (req, res) => {
   return res.json({
     ref: reservation.ref,
     route: reservation.route,
-    status: reservation.status, // "confirmed" | "completed" | "cancelled"
+    status: effectiveStatus(reservation), // "confirmed" | "completed" | "cancelled"
     updated_at: reservation.updatedAt,
   });
 });
@@ -619,6 +630,43 @@ app.post("/api/reserve", reserveLimiter, (req, res) => {
     const status = err instanceof ApiError ? err.status : 400;
     return res.status(status).json({ error: err.message || "invalid reservation request" });
   }
+});
+
+// Operator override of a reservation's lifecycle state — the carrier/agency
+// action a real integration would expose. Authenticated with the same bearer
+// token the contract uses for /status reads, so only someone holding
+// AGENCY_AUTH_TOKEN can flip states. "completed" lets a trip settle before
+// its return date (testing/ops); "cancelled" exercises the dispute-refund
+// path. Rate-limited like /api/reserve.
+const statusLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) => res.status(429).json({ error: "Too many status updates. Try again shortly." }),
+});
+
+app.post("/api/reservations/:ref/status", statusLimiter, (req, res) => {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  if (!AGENCY_AUTH_TOKEN || token !== AGENCY_AUTH_TOKEN) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const ref = String(req.params.ref || "").trim().toUpperCase();
+  if (!ref || !/^[A-Z0-9]{4,12}$/.test(ref)) {
+    return res.status(400).json({ error: "invalid reservation ref" });
+  }
+  const reservation = cache.reservations.get(ref);
+  if (!reservation) {
+    return res.status(404).json({ error: "unknown reservation" });
+  }
+  const status = String(req.body?.status || "").trim().toLowerCase();
+  if (!["completed", "cancelled"].includes(status)) {
+    return res.status(400).json({ error: "status must be 'completed' or 'cancelled'" });
+  }
+  reservation.status = status;
+  reservation.updatedAt = Date.now();
+  return res.json({ ref: reservation.ref, status });
 });
 
 app.use((err, _req, res, _next) => {
