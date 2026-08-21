@@ -224,6 +224,20 @@ class TravelAgent(gl.Contract):
             return {}
         return json.loads(raw)
 
+    @gl.public.view
+    def view_provider_config(self) -> dict:
+        """Diagnostics: the owner-set settlement + auth configuration. The
+        token is already public on-chain (docs/security.md trade-off), so
+        returning it here leaks nothing new — it makes misconfiguration
+        (wrong/missing bearer token vs the provider's expected value)
+        diagnosable instead of a silent 401 inside a consensus block."""
+        return {
+            "provider_address": str(self.provider_address),
+            "feed_base": self.feed_base,
+            "auth_token": self.provider_auth_token,
+            "auth_configured": self.provider_auth_token != "",
+        }
+
     # -- Quote ---------------------------------------------------------------
 
     @gl.public.write
@@ -380,6 +394,18 @@ class TravelAgent(gl.Contract):
         token = self.provider_auth_token
 
         def get_status() -> str:
+            """Deterministic completion verdict derived from the authenticated
+            evidence itself — no LLM judgment. The feed is owner-configured and
+            bearer-authenticated, and its JSON echoes the reservation ref plus
+            a lifecycle status, so "yes" requires: HTTP 200 + this exact ref +
+            status "completed". Anything else (401, unknown ref, cancelled,
+            still-confirmed) is "no".
+
+            This replaced an exec_prompt + prompt_non_comparative flow whose
+            validators judged the leader's answer against criteria WITHOUT
+            seeing the evidence — criteria said "answer no unless the ref is
+            present in the evidence", which blind validators conservatively
+            did, reverting every completion regardless of evidence quality."""
             res = gl.nondet.web.get(
                 feed + "/status?ref=" + ref,
                 headers={"Authorization": "Bearer " + token},
@@ -387,30 +413,24 @@ class TravelAgent(gl.Contract):
             if _http_status(res) != 200:
                 # auth failure or provider error is not evidence of anything
                 return "no"
-            page = res.body.decode("utf-8")
-            ok = gl.nondet.exec_prompt(
-                "This is an authenticated carrier/agency status read for "
-                "reservation " + ref + ". Reply only 'yes' or 'no': does this "
-                "evidence confirm reservation " + ref + " exists and "
-                "completed without full cancellation? Reply 'no' if the "
-                "reservation reference is not present in the evidence. "
-                + page[:4000]
-            )
-            return ok.strip().lower()
+            try:
+                page = json.loads(res.body.decode("utf-8"))
+            except Exception:
+                return "no"
+            if not isinstance(page, dict):
+                return "no"
+            echoed_ref = str(page.get("ref", "")).strip().upper()
+            status = str(page.get("status", "")).strip().lower()
+            if echoed_ref == ref and status == "completed":
+                return "yes"
+            return "no"
 
-        # prompt_non_comparative takes (fn, task=, criteria=) — not (fn, principle) —
-        # confirmed against docs.genlayer.com/.../examples/llm-hello-world-non-comparative.
-        # Validators evaluate the leader's answer against these criteria rather than
-        # re-deriving and comparing values, which fits a yes/no judgment call better
-        # than prompt_comparative.
-        verdict = gl.eq_principle.prompt_non_comparative(
-            get_status,
-            task="Answer only 'yes' or 'no': does the authenticated evidence "
-                 "confirm reservation " + ref + " completed without full cancellation?",
-            criteria="Response must be a clear yes/no-style answer, and must be "
-                      "'no' unless the reservation reference is present in the evidence.",
-        )
-        if str(verdict).lower() not in ("yes", "true", "1", "done", "completed"):
+        # strict_eq over a DERIVED value: every validator re-fetches the same
+        # authenticated URL and derives the same yes/no from byte-identical
+        # JSON (the server serves date-granular, deterministic bodies). No LLM
+        # in the loop, so no judgment drift between validators.
+        verdict = gl.eq_principle.strict_eq(get_status)
+        if str(verdict).strip().lower() != "yes":
             raise gl.vm.UserError("trip completion not verified")
 
         booking["status"] = "completed"

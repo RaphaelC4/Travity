@@ -32,11 +32,13 @@ one defeats the others:
    reservation was actually created off-chain. `confirm_completion` and
    `escalate` both refuse to run until the owner has called
    `set_provider_auth` with a bearer token, and both send that token as an
-   `Authorization: Bearer …` header on every provider read. The consensus
-   prompt is instructed to answer "no" (or, for disputes, award a full
-   refund) unless the evidence actually references that specific
-   `reservation_ref` — a generic status page, or a 401/expired-auth response,
-   is never accepted as proof of anything.
+   `Authorization: Bearer …` header on every provider read. Completion
+   verification is deterministic: validators re-fetch the authenticated
+   `/status` endpoint and derive "yes" only from HTTP 200 + the booking's own
+   `reservation_ref` echoed back + lifecycle status `"completed"` (settled
+   via `strict_eq`, no LLM judgment in the loop). A generic status page, a
+   401/expired-auth response, or evidence naming a different ref is never
+   accepted as proof of anything.
 2. **Customer-only dispute authorization.** `file_dispute` checks
    `gl.message.sender_address` against `booking["customer"]` before accepting
    a claim — only the person who escrowed the funds for a booking can dispute

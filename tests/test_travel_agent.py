@@ -93,7 +93,7 @@ def _install_gl_mock():
         ),
         evm=types.SimpleNamespace(contract_interface=lambda c: _Proxy),
         nondet=types.SimpleNamespace(
-            web=types.SimpleNamespace(get=lambda url, headers=None: _FakeResponse("200")),
+            web=types.SimpleNamespace(get=_fake_status_page),
             exec_prompt=lambda p: "100",
         ),
         vm=types.SimpleNamespace(
@@ -119,6 +119,16 @@ class _FakeResponse:
     def __init__(self, text, status=200):
         self.body = text.encode("utf-8")
         self.status = status
+
+
+def _fake_status_page(url, headers=None):
+    """Default /status mock: echoes the requested ref with a completed
+    lifecycle state, mirroring the real quote server's evidence body."""
+    import urllib.parse as _up
+
+    q = _up.urlparse(url).query
+    ref = _up.parse_qs(q).get("ref", [""])[0]
+    return _FakeResponse(json.dumps({"ref": ref, "route": "TEST", "status": "completed"}))
 
 
 _install_gl_mock()
@@ -275,8 +285,6 @@ class TestLoyalty:
 
         # owner must be the caller for minting
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")
-        import genlayer
-        genlayer.gl.nondet.exec_prompt = lambda p: "yes"
         agent.confirm_completion(bid)
         # loyalty mints to the CUSTOMER who booked, not the caller
         assert agent.loyalty["0xALICE"] == LOYALTY_PER_BOOKING
@@ -314,10 +322,47 @@ class TestLoyalty:
             "genlayer.gl.nondet.web.get",
             lambda url, headers=None: _FakeResponse("401", status=401),
         )
-        monkeypatch.setattr("genlayer.gl.nondet.exec_prompt", lambda p: "yes")  # even if the LLM would say yes
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="trip completion not verified"):
             agent.confirm_completion(bid)
+
+    def test_confirm_completion_rejects_uncompleted_evidence(self, agent, monkeypatch):
+        """Evidence saying the trip is still 'confirmed' is not completion."""
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
+        monkeypatch.setattr("genlayer.gl.message.value", 500_000)
+        bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
+
+        monkeypatch.setattr(
+            "genlayer.gl.nondet.web.get",
+            lambda url, headers=None: _FakeResponse(
+                json.dumps({"ref": "PNR-ABC123", "status": "confirmed"})
+            ),
+        )
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")
+        with pytest.raises(RuntimeError, match="trip completion not verified"):
+            agent.confirm_completion(bid)
+
+    def test_confirm_completion_rejects_ref_mismatch_evidence(self, agent, monkeypatch):
+        """Evidence about a DIFFERENT reservation must not verify this one."""
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
+        monkeypatch.setattr("genlayer.gl.message.value", 500_000)
+        bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
+
+        monkeypatch.setattr(
+            "genlayer.gl.nondet.web.get",
+            lambda url, headers=None: _FakeResponse(
+                json.dumps({"ref": "OTHER-REF", "status": "completed"})
+            ),
+        )
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")
+        with pytest.raises(RuntimeError, match="trip completion not verified"):
+            agent.confirm_completion(bid)
+
+    def test_view_provider_config_reports_settings(self, agent):
+        cfg = agent.view_provider_config()
+        assert cfg["provider_address"] == "0xPROVIDER"
+        assert cfg["auth_configured"] is True
+        assert cfg["feed_base"] == "https://example.co"
 
     def test_non_owner_cannot_confirm(self, agent, monkeypatch):
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
