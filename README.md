@@ -77,7 +77,7 @@ sources.
    on Studionet via `genlayer-js`.
 
 Deployed contract (Studionet):
-`0xEC18676022B24e5c0680d5eA8A48B55A43Be578c`
+`0xC3A744CAe8F4A625b6026D8d70F18a095e683f2e`
 
 The contract intentionally exposes: `refresh_quote` (web price via validator
 consensus), `book` (payable escrow + overpayment credit), `confirm_completion`
