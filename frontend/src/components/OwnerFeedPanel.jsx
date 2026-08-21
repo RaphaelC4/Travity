@@ -2,7 +2,14 @@ import { useState } from "react";
 import { client, fmtGen } from "../lib/genlayer";
 import { useWallet } from "../hooks/useWallet";
 
-const OWNER = String(import.meta.env.VITE_GENLAYER_OWNER_ADDRESS || "").trim();
+// Owner address: env override first, then the deployed contract's owner as a
+// built-in fallback. The address is public by nature (it's readable on-chain
+// as the contract owner), so baking it costs nothing security-wise and keeps
+// the panel working on hosts where the env var wasn't set at build time.
+const OWNER = String(
+  import.meta.env.VITE_GENLAYER_OWNER_ADDRESS ||
+    "0xc048310B6AD26D7cf35eF068A83CBe6793864Fd1"
+).trim();
 const FEED_URL = String(import.meta.env.VITE_QUOTE_API || "").trim().replace(/\/+$/, "");
 
 // Hard blockers: unusable as a feed no matter what.
