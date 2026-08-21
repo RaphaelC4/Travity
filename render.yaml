@@ -1,6 +1,7 @@
-# Render blueprint — deploy the Travity quote server
+# Render blueprint — Travity quote server + frontend static site.
 # https://dashboard.render.com/blueprints from the repo root picks this up.
 services:
+  # ---- Quote server (Express, fare -> GEN, /api/reserve + /status) ----
   - type: web
     name: travity-server
     runtime: node
@@ -24,3 +25,41 @@ services:
         value: "1800000"
       - key: QUOTE_PROXY_RATE_LIMIT
         value: "30"
+      # Bearer token for authenticated /status evidence reads. MUST match the
+      # on-chain provider_auth_token set via the owner panel (set_provider_auth).
+      - key: AGENCY_AUTH_TOKEN
+        sync: false
+
+  # ---- Frontend (React + Vite static site; free on Render) ----
+  # VITE_* vars are baked into the bundle at BUILD time — changing one here or
+  # in the dashboard requires a new deploy to take effect.
+  - type: web
+    name: travity-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_GENLAYER_RPC
+        value: https://studio.genlayer.com/api
+      - key: VITE_GENLAYER_CONTRACT_ADDRESS
+        value: 0xC3A744CAe8F4A625b6026D8d70F18a095e683f2e
+      - key: VITE_GENLAYER_CHAIN_ID
+        value: "61999"
+      # Public quote server origin — also the on-chain feed root set via
+      # set_feed_url. Must stay in sync with VITE_QUOTE_API semantics.
+      - key: VITE_QUOTE_API
+        value: https://travity-server.onrender.com
+      # Contract owner address — shows the owner admin panel when this wallet
+      # is connected. Public by nature (it's an on-chain address).
+      - key: VITE_GENLAYER_OWNER_ADDRESS
+        sync: false
+      # Optional: WalletConnect project id (cloud.walletconnect.com). Leave
+      # unset to fall back to an injected wallet extension.
+      - key: VITE_WC_PROJECT_ID
+        sync: false
+    # SPA routing: let react-router handle /book, /disputes, etc.
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
