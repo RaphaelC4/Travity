@@ -30,6 +30,8 @@
 import "dotenv/config";
 import express from "express";
 import rateLimit from "express-rate-limit";
+import fs from "node:fs";
+import path from "node:path";
 
 const PORT = Number(process.env.PORT || 8080);
 const OMKAR = {
@@ -75,6 +77,46 @@ const OUTAGE_COOLDOWN_MS = Number(process.env.OUTAGE_COOLDOWN_MS || 30 * 1000);
 const QUOTE_STALE_MAX_MS = Number(process.env.QUOTE_STALE_MAX_MS || 7 * 24 * 60 * 60 * 1000);
 
 const cache = { genUsd: null, quotes: new Map(), reservations: new Map() };
+
+// Reservations MUST survive process restarts: confirm_completion/escalate on
+// the contract can be called weeks after booking, and an in-memory-only Map
+// loses every reservation on any restart/redeploy (Render free tier spins
+// down on inactivity; Railway restarts on deploys/maintenance). A wiped
+// reservation makes /status 404 forever, which the contract correctly reads
+// as "not completed" — permanently, with no way to fix it from the contract
+// side. Persist to a JSON file on disk and reload it at boot.
+const RESERVATIONS_FILE = process.env.RESERVATIONS_FILE || path.join(process.cwd(), "data", "reservations.json");
+
+function loadReservations() {
+  try {
+    const raw = fs.readFileSync(RESERVATIONS_FILE, "utf8");
+    const obj = JSON.parse(raw);
+    for (const [ref, rec] of Object.entries(obj)) {
+      cache.reservations.set(ref, rec);
+    }
+    console.log(`[quote-server] loaded ${cache.reservations.size} reservation(s) from ${RESERVATIONS_FILE}`);
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      console.error(`[quote-server] WARNING: failed to load ${RESERVATIONS_FILE}: ${err.message}`);
+    }
+  }
+}
+
+function saveReservations() {
+  try {
+    fs.mkdirSync(path.dirname(RESERVATIONS_FILE), { recursive: true });
+    const obj = Object.fromEntries(cache.reservations);
+    // Atomic write: write to a temp file then rename, so a crash mid-write
+    // never corrupts/truncates the persisted file.
+    const tmp = `${RESERVATIONS_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(obj), "utf8");
+    fs.renameSync(tmp, RESERVATIONS_FILE);
+  } catch (err) {
+    console.error(`[quote-server] WARNING: failed to persist reservations: ${err.message}`);
+  }
+}
+
+loadReservations();
 
 // PNRs are 6-char IATA-style alphanumerics (excluding lookalike chars).
 const PNR_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -625,6 +667,7 @@ app.post("/api/reserve", reserveLimiter, (req, res) => {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
+    saveReservations();
     return res.status(201).json({ ref: pnr, route: `${f}-${t}`, status: "confirmed" });
   } catch (err) {
     const status = err instanceof ApiError ? err.status : 400;
@@ -666,6 +709,7 @@ app.post("/api/reservations/:ref/status", statusLimiter, (req, res) => {
   }
   reservation.status = status;
   reservation.updatedAt = Date.now();
+  saveReservations();
   return res.json({ ref: reservation.ref, status });
 });
 
