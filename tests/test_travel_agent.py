@@ -277,101 +277,103 @@ class TestBooking:
             agent.book("JFK", "LHR", 20261010, 20261001, "PNR-ABC123")  # return before depart
 
 
-class TestLoyalty:
-    def test_mint_on_verified_completion(self, agent, monkeypatch):
+class TestSettlement:
+    """settle_booking / force_complete — deterministic settlement paths."""
+
+    def _travel_past_return(self, agent):
+        from datetime import datetime, timezone
+
+        ret_ts = agent._yyyymmdd_to_ts(20261010)
+        after = int(datetime(2026, 10, 12, tzinfo=timezone.utc).timestamp())
+        assert after > ret_ts
+        agent._current_time = lambda: after
+
+    def test_settle_after_return_date_pays_and_mints(self, agent, monkeypatch):
+        """Integration: ordinary booking -> verified settlement. The escrowed
+        fare reaches the provider exactly once and loyalty mints to the
+        CUSTOMER who booked (not the caller)."""
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
         monkeypatch.setattr("genlayer.gl.message.value", 500_000)
         bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
 
-        # owner must be the caller for minting
-        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")
-        agent.confirm_completion(bid)
+        self._travel_past_return(agent)
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xSTRANGER")  # anyone may settle
+        agent.settle_booking(bid)
+
+        record = json.loads(agent.bookings[bid])
+        assert record["status"] == "completed"
+        assert record["completion_verified"] is True
+        assert record["settled"] is True
+        assert record["settled_wei"] == 500_000
         # loyalty mints to the CUSTOMER who booked, not the caller
         assert agent.loyalty["0xALICE"] == LOYALTY_PER_BOOKING
         # the escrowed fare settles to the provider, exactly once
         assert _Proxy.calls == [("0xPROVIDER", 500_000)]
-        assert json.loads(agent.bookings[bid])["settled"] is True
 
-    def test_confirm_completion_requires_provider_configured(self, agent, monkeypatch):
+    def test_settle_before_return_date_reverts(self, agent, monkeypatch):
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
+        monkeypatch.setattr("genlayer.gl.message.value", 500_000)
+        bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
+
+        agent._current_time = lambda: agent._yyyymmdd_to_ts(20261010) - 1
+        with pytest.raises(RuntimeError, match="return date"):
+            agent.settle_booking(bid)
+        assert _Proxy.calls == []
+
+    def test_settle_unknown_booking_reverts(self, agent, monkeypatch):
+        self._travel_past_return(agent)
+        with pytest.raises(RuntimeError, match="unknown booking"):
+            agent.settle_booking("NOPE")
+
+    def test_settle_is_not_payable_twice(self, agent, monkeypatch):
+        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
+        monkeypatch.setattr("genlayer.gl.message.value", 500_000)
+        bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
+
+        self._travel_past_return(agent)
+        agent.settle_booking(bid)
+        with pytest.raises(RuntimeError, match="not settleable"):
+            agent.settle_booking(bid)
+        assert _Proxy.calls == [("0xPROVIDER", 500_000)]
+
+    def test_settle_requires_provider_configured(self, agent, monkeypatch):
         agent.provider_address = ADMIN_ZERO
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
         monkeypatch.setattr("genlayer.gl.message.value", 500_000)
         bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
 
-        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")
+        self._travel_past_return(agent)
         with pytest.raises(RuntimeError, match="set_provider"):
-            agent.confirm_completion(bid)
+            agent.settle_booking(bid)
 
-    def test_confirm_completion_requires_provider_auth(self, agent, monkeypatch):
-        agent.provider_auth_token = ""
+    def test_force_complete_settles_immediately(self, agent, monkeypatch):
+        """Owner override skips the date check — same payout + mint effects."""
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
         monkeypatch.setattr("genlayer.gl.message.value", 500_000)
         bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
 
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")
-        with pytest.raises(RuntimeError, match="set_provider_auth"):
-            agent.confirm_completion(bid)
+        agent.force_complete(bid)
 
-    def test_confirm_completion_rejects_unauthenticated_evidence(self, agent, monkeypatch):
-        """A 401/expired-auth response must never read as 'trip completed'."""
+        record = json.loads(agent.bookings[bid])
+        assert record["status"] == "completed"
+        assert record["settled_wei"] == 500_000
+        assert agent.loyalty["0xALICE"] == LOYALTY_PER_BOOKING
+        assert _Proxy.calls == [("0xPROVIDER", 500_000)]
+
+    def test_force_complete_rejects_non_owner(self, agent, monkeypatch):
         monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
         monkeypatch.setattr("genlayer.gl.message.value", 500_000)
         bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
 
-        monkeypatch.setattr(
-            "genlayer.gl.nondet.web.get",
-            lambda url, headers=None: _FakeResponse("401", status=401),
-        )
-        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")
-        with pytest.raises(RuntimeError, match="trip completion not verified"):
-            agent.confirm_completion(bid)
-
-    def test_confirm_completion_rejects_uncompleted_evidence(self, agent, monkeypatch):
-        """Evidence saying the trip is still 'confirmed' is not completion."""
-        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
-        monkeypatch.setattr("genlayer.gl.message.value", 500_000)
-        bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
-
-        monkeypatch.setattr(
-            "genlayer.gl.nondet.web.get",
-            lambda url, headers=None: _FakeResponse(
-                json.dumps({"ref": "PNR-ABC123", "status": "confirmed"})
-            ),
-        )
-        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")
-        with pytest.raises(RuntimeError, match="trip completion not verified"):
-            agent.confirm_completion(bid)
-
-    def test_confirm_completion_rejects_ref_mismatch_evidence(self, agent, monkeypatch):
-        """Evidence about a DIFFERENT reservation must not verify this one."""
-        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
-        monkeypatch.setattr("genlayer.gl.message.value", 500_000)
-        bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
-
-        monkeypatch.setattr(
-            "genlayer.gl.nondet.web.get",
-            lambda url, headers=None: _FakeResponse(
-                json.dumps({"ref": "OTHER-REF", "status": "completed"})
-            ),
-        )
-        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xOWNER")
-        with pytest.raises(RuntimeError, match="trip completion not verified"):
-            agent.confirm_completion(bid)
+        with pytest.raises(RuntimeError, match="only owner"):
+            agent.force_complete(bid)
 
     def test_view_provider_config_reports_settings(self, agent):
         cfg = agent.view_provider_config()
         assert cfg["provider_address"] == "0xPROVIDER"
         assert cfg["auth_configured"] is True
         assert cfg["feed_base"] == "https://example.co"
-
-    def test_non_owner_cannot_confirm(self, agent, monkeypatch):
-        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xALICE")
-        monkeypatch.setattr("genlayer.gl.message.value", 500_000)
-        bid = agent.book("JFK", "LHR", 20261001, 20261010, "PNR-ABC123")
-
-        monkeypatch.setattr("genlayer.gl.message.sender_address", "0xINTRUDER")
-        with pytest.raises(RuntimeError):
-            agent.confirm_completion(bid)
 
 
 class TestDispute:

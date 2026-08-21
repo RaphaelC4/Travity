@@ -106,8 +106,8 @@ export default function Book() {
     setBusy(true);
     try {
       // A reservation must exist at the agency before escrow: the PNR returned
-      // here is the anchor confirm_completion/escalate verify against
-      // authenticated /status evidence. It cannot be made up by the client.
+      // here is the anchor dispute escalation verifies against authenticated
+      // /status evidence. It cannot be made up by the client.
       const reservationRef = await client.createReservation({
         origin: form.origin, destination: form.destination,
         depart: form.depart, ret: form.ret,
@@ -134,11 +134,19 @@ export default function Book() {
     if (!booking) return;
     setBusy(true);
     try {
-      await client.confirmCompletion(booking.id, wallet.account, wallet.provider);
+      // Deterministic settlement: succeeds once the return date has passed.
+      // No evidence fetch, no consensus — the contract applies a fixed rule.
+      await client.settleBooking(booking.id, wallet.account, wallet.provider);
       setBooking((b) => ({ ...b, done: true }));
-      showToast("Trip verified. Loyalty credits minted to your wallet.", "status");
+      showToast("Trip settled: fare paid to the operator and loyalty credits minted to your wallet.", "status");
     } catch (err) {
-      showToast("Verification failed: " + (err.message || "unknown error"), "alert");
+      const msg = err?.message || "unknown error";
+      showToast(
+        /return date/i.test(msg)
+          ? "Settlement unlocks the day after your return date."
+          : "Settlement failed: " + msg,
+        "alert"
+      );
     } finally {
       setBusy(false);
     }
@@ -248,11 +256,16 @@ export default function Book() {
                 <div className="list-line"><span className="k">Status</span><span className="v"><span className="pill pill-accepted">CONFIRMED</span></span></div>
                 {!booking.done ? (
                   needsWallet ? (
-                    <WalletButton label="Connect to verify trip" onError={(m) => showToast(m, "alert")} />
+                    <WalletButton label="Connect to settle trip" onError={(m) => showToast(m, "alert")} />
                   ) : (
-                    <button className="btn btn-secondary" style={{ marginTop: 16 }} onClick={verifyTrip} disabled={busy}>
-                      Verify completed trip
-                    </button>
+                    <>
+                      <button className="btn btn-secondary" style={{ marginTop: 16 }} onClick={verifyTrip} disabled={busy}>
+                        Settle completed trip
+                      </button>
+                      <p className="hint" style={{ marginTop: 6 }}>
+                        Settlement unlocks the day after your return date — the contract applies a fixed rule, no review needed.
+                      </p>
+                    </>
                   )
                 ) : (
                   <div className="list-line"><span className="k">Rewards</span><span className="v">Loyalty minted</span></div>

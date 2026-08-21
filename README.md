@@ -1,7 +1,8 @@
 # Travity
 
 Travity is a GenLayer-powered travel agent: live web fares, escrowed GEN
-payments, on-chain loyalty rewards, and AI-adjudicated disputes.
+payments, on-chain loyalty credit accounting, and AI-adjudicated one-shot
+dispute refunds.
 
 ## Layout
 
@@ -80,9 +81,11 @@ Deployed contract (Studionet):
 `0x555641cE4741a2BACc868AA74Be3C68cBA6B4457`
 
 The contract intentionally exposes: `refresh_quote` (web price via validator
-consensus), `book` (payable escrow + overpayment credit), `confirm_completion`
-(owner-only, web-verified loyalty mint), `file_dispute` / `escalate`
-(AI-adjudicated refund with appeals), and `balance_of`.
+consensus), `book` (payable escrow + overpayment credit), `settle_booking`
+(permissionless deterministic settlement once the return date passes) and
+`force_complete` (owner override), `file_dispute` / `escalate` (one-shot
+AI-adjudicated refund), `balance_of` (internal loyalty-credit balance — not
+withdrawable or transferable), and `view_provider_config`.
 
 ## Security
 

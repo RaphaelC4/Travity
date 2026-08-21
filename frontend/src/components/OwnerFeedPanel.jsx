@@ -168,9 +168,12 @@ export function OwnerFeedPanel() {
         <div className="panel" style={{ marginTop: 24 }}>
           <h2 id="owner-provider-heading">Owner · Settlement &amp; authentication</h2>
           <p style={{ margin: "12px 0", color: "var(--ink-soft)" }}>
-            <span className="mono">confirm_completion</span> and <span className="mono">escalate</span> both
-            refuse to run until these two are set. Neither is bundled from an env var — type them in below,
-            per session, so the auth token never ends up in the public JS build.
+            Settlement (<span className="mono">settle_booking</span>/
+            <span className="mono">force_complete</span>) needs the payout
+            address; dispute escalation additionally needs the bearer token on
+            its evidence reads. Neither is bundled from an env var — type them
+            in below, per session, so the auth token never ends up in the
+            public JS build.
           </p>
 
           <div className="form-field" style={{ marginTop: 12 }}>

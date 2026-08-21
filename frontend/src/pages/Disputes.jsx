@@ -58,7 +58,9 @@ export default function Disputes() {
           <h1>Fast, fair answers</h1>
           <p className="lede">
             File a claim and it's reviewed automatically against your booking
-            details. If it's upheld, your refund is capped at the fare you paid.
+            details. If it's upheld, your refund is capped at the fare you
+            paid. The ruling is one-shot: escalating settles the refund and
+            the remainder immediately, with no further appeals.
           </p>
         </div>
       </section>

@@ -156,7 +156,7 @@ class TravelAgent(gl.Contract):
     def set_provider_auth(self, token: str) -> None:
         """Owner-only: bearer token attached to provider status reads.
 
-        Without this, `confirm_completion`/`escalate` would treat an
+        Without this, `escalate` would treat an
         unauthenticated, spoofable page fetch as evidence. The token ties
         the read to a real, authenticated carrier/agency session.
         """
@@ -313,7 +313,7 @@ class TravelAgent(gl.Contract):
         server creates the reservation via the provider's booking API before
         the customer escrows funds, and passes the resulting reference
         through here). It's only format-checked at booking time — it's the
-        anchor that `confirm_completion`/`escalate` later verify against
+        anchor that `escalate` later verifies against
         authenticated provider evidence, so a caller can't just make one up
         and have it accepted as proof of anything.
         """
@@ -362,83 +362,67 @@ class TravelAgent(gl.Contract):
         return booking_id
 
     @gl.public.write
-    def confirm_completion(self, booking_id: str) -> None:
-        """Verify a trip completed using AUTHENTICATED carrier/agency
-        evidence tied to this booking's own reservation, settle the
-        escrowed fare to the provider, then mint loyalty to the CUSTOMER
-        who made the booking (not the caller).
+    def settle_booking(self, booking_id: str) -> None:
+        """Settle a completed trip: pay the escrowed fare to the provider and
+        mint loyalty to the CUSTOMER who booked.
 
-        Verification runs inside a prompt_non_comparative consensus block,
-        so validators independently query the provider (with the owner-set
-        bearer token) and independently confirm the response references this
-        booking's reservation_ref — a generic page or an unauthenticated
-        "yes" is not accepted as evidence. Owner-gated since it issues
-        value-bearing loyalty and moves escrowed funds.
+        Permissionless because the outcome is fixed by a deterministic rule,
+        not by the caller: the booking must be confirmed, unsettled, and the
+        return date must have passed. No web fetch, no LLM, no consensus
+        block — this replaced an evidence-fetching confirm_completion whose
+        external dependencies (validator fetches, bearer-token coupling,
+        provider availability) made settlement unreliable in practice.
+        Authenticated carrier evidence remains in the DISPUTE path, where it
+        decides refunds instead of payouts.
         """
+        self._unpaused()
+        raw = self.bookings.get(booking_id)
+        if raw is None:
+            raise gl.vm.UserError("unknown booking")
+        booking = json.loads(raw)
+        if booking["status"] != "confirmed" or booking["completion_verified"]:
+            raise gl.vm.UserError("booking not settleable")
+        if self._current_time() <= u256(self._yyyymmdd_to_ts(int(booking["ret"]))):
+            raise gl.vm.UserError("return date has not passed yet")
+        self._settle(booking_id, booking)
+
+    @gl.public.write
+    def force_complete(self, booking_id: str) -> None:
+        """Owner-only operator override: settle immediately without waiting
+        for the return date. Same payout + loyalty effects as settle_booking;
+        exists so the operator can resolve trips early (e.g. customer support)
+        without any off-chain state."""
         self._only_owner()
         raw = self.bookings.get(booking_id)
         if raw is None:
             raise gl.vm.UserError("unknown booking")
         booking = json.loads(raw)
         if booking["status"] != "confirmed" or booking["completion_verified"]:
-            raise gl.vm.UserError("booking not verifiable")
-        ref = booking.get("reservation_ref", "")
-        if not ref:
-            raise gl.vm.UserError("booking has no reservation reference on file")
-        if not self.provider_auth_token:
-            raise gl.vm.UserError("provider authentication not configured: owner must call set_provider_auth")
+            raise gl.vm.UserError("booking not settleable")
+        self._settle(booking_id, booking)
+
+    def _yyyymmdd_to_ts(self, d: int) -> int:
+        """End-of-day UTC unix timestamp for a YYYYMMDD date int. The stored
+        depart/ret are calendar dates while _current_time() is a unix
+        timestamp; comparing them directly would be meaningless, so convert
+        here. Settlement unlocks strictly AFTER the whole return day."""
+        s = str(d)
+        year, month, day = int(s[:4]), int(s[4:6]), int(s[6:8])
+        dt = datetime(year, month, day, 23, 59, 59, tzinfo=timezone.utc)
+        return int(dt.timestamp())
+
+    def _settle(self, booking_id: str, booking: dict) -> None:
+        """Shared settlement effects: fare -> provider (once), loyalty ->
+        customer, status -> completed. Checks-effects-interactions: all state
+        mutations are ordered before the external transfer emission."""
         if self.provider_address == ADMIN_ZERO:
             raise gl.vm.UserError("provider payout address not configured: owner must call set_provider")
-
-        feed = self.feed_base
-        token = self.provider_auth_token
-
-        def get_status() -> str:
-            """Deterministic completion verdict derived from the authenticated
-            evidence itself — no LLM judgment. The feed is owner-configured and
-            bearer-authenticated, and its JSON echoes the reservation ref plus
-            a lifecycle status, so "yes" requires: HTTP 200 + this exact ref +
-            status "completed". Anything else (401, unknown ref, cancelled,
-            still-confirmed) is "no".
-
-            This replaced an exec_prompt + prompt_non_comparative flow whose
-            validators judged the leader's answer against criteria WITHOUT
-            seeing the evidence — criteria said "answer no unless the ref is
-            present in the evidence", which blind validators conservatively
-            did, reverting every completion regardless of evidence quality."""
-            res = gl.nondet.web.get(
-                feed + "/status?ref=" + ref,
-                headers={"Authorization": "Bearer " + token},
-            )
-            if _http_status(res) != 200:
-                # auth failure or provider error is not evidence of anything
-                return "no"
-            try:
-                page = json.loads(res.body.decode("utf-8"))
-            except Exception:
-                return "no"
-            if not isinstance(page, dict):
-                return "no"
-            echoed_ref = str(page.get("ref", "")).strip().upper()
-            status = str(page.get("status", "")).strip().lower()
-            if echoed_ref == ref and status == "completed":
-                return "yes"
-            return "no"
-
-        # strict_eq over a DERIVED value: every validator re-fetches the same
-        # authenticated URL and derives the same yes/no from byte-identical
-        # JSON (the server serves date-granular, deterministic bodies). No LLM
-        # in the loop, so no judgment drift between validators.
-        verdict = gl.eq_principle.strict_eq(get_status)
-        if str(verdict).strip().lower() != "yes":
-            raise gl.vm.UserError("trip completion not verified")
 
         booking["status"] = "completed"
         booking["completion_verified"] = True
 
-        # Settlement path: the escrowed fare goes to the carrier/agency now
-        # that verified, authenticated completion evidence exists. Guarded
-        # so a booking is never settled twice.
+        # Settlement path: the escrowed fare goes to the carrier/agency.
+        # Guarded so a booking is never settled twice.
         if not booking.get("settled"):
             price = u256(booking["price_wei"])
             _Payee(self.provider_address).emit_transfer(value=price)
@@ -470,7 +454,7 @@ class TravelAgent(gl.Contract):
             raise gl.vm.UserError("only the booking customer may file a dispute")
         if booking["status"] != "confirmed":
             # Once a booking is "completed" it has already been settled in
-            # full to the provider (confirm_completion), and "disputed" /
+            # full to the provider (settle_booking), and "disputed" /
             # "resolved" bookings have already gone through escalate()'s
             # settlement. There is no escrow left to split once either
             # settlement path has run, so a dispute can only be opened
@@ -535,7 +519,7 @@ class TravelAgent(gl.Contract):
         price_max = u256(booking["price_wei"])
         reason = str(dispute["reason"])
 
-        # Same nondet-storage rule as refresh_quote/confirm_completion: capture
+        # Same nondet-storage rule as refresh_quote: capture
         # the feed root before the closure instead of reading storage inside it.
         feed = self.feed_base
         token = self.provider_auth_token
