@@ -66,13 +66,13 @@ const persistBookings = (list) => {
 
 const loadBookings = () => {
   try {
-    // Migrate the pre-contract-scoped key (travity.bookings.v1) into this
-    // contract's list so prior trips aren't lost on first load after upgrade.
-    const legacy = JSON.parse(localStorage.getItem("travity.bookings.v1") || "[]");
+    // NOTE: deliberately NO cross-contract migration. Bookings are scoped to
+    // one deployed address; pulling trips from an older deployment here made
+    // them look actionable when the current contract can never resolve their
+    // ids ("unknown booking" revert on confirm_completion/disputes).
     const raw = JSON.parse(localStorage.getItem(bookingsKey()) || "[]");
-    const merged = Array.isArray(raw) && raw.length ? raw : legacy;
-    if (!Array.isArray(merged)) return [];
-    return merged.map((b) => ({
+    if (!Array.isArray(raw)) return [];
+    return raw.map((b) => ({
       id: String(b.id || ""),
       onChainId: String(b.onChainId || b.id || ""),
       route: String(b.route || ""),
@@ -466,7 +466,16 @@ export class TravityClient {
   }
 
   async confirmCompletion(bookingId, account, provider) {
+    // Pre-flight: a booking id from an older deployment (or a typo) reverts
+    // on-chain with "unknown booking" and burns gas. Fail here, for free,
+    // with an actionable message instead.
     const client = await this.writeClient(account, provider);
+    const existing = await runRead(client, "view_booking", [bookingId]);
+    if (!existing || Object.keys(existing).length === 0) {
+      throw new Error(
+        "This booking does not exist on the current contract — it was made on a previous deployment. Book again on this contract, then confirm."
+      );
+    }
     await runWrite(client, { functionName: "confirm_completion", args: [bookingId], value: 0n });
     const b = sessionBookings.find((x) => x.id === bookingId);
     if (b) { b.status = "completed"; b.completion = true; persistBookings(sessionBookings); }
