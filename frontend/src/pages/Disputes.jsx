@@ -28,7 +28,7 @@ export default function Disputes() {
       const id = await client.fileDispute(bookingId.trim(), trimmed, wallet.account, wallet.provider);
       setDispute({ id, bookingId: bookingId.trim(), reason: trimmed, status: "pending", rounds: 0, refund: null });
       setErrors({});
-      showToast("Dispute filed. We're reviewing it now.");
+      showToast("Dispute filed. Escalate for the final ruling when ready.");
     } catch (err) {
       showToast("Could not file: " + (err.message || "unknown error"), "alert");
     } finally {
@@ -114,7 +114,7 @@ export default function Disputes() {
                   </div>
                 ) : (
                   <button className="btn btn-accent" style={{ marginTop: 16 }} onClick={escalate} disabled={busy}>
-                    Ask for a second review
+                    Escalate for final ruling
                   </button>
                 )
               )}
@@ -125,9 +125,10 @@ export default function Disputes() {
         <aside className="panel" aria-label="How disputes work">
           <h2>Lifecycle</h2>
           <p style={{ color: "var(--ink-soft)", fontSize: "0.9rem", margin: 0 }}>
-            Claims move through <strong>pending → accepted → finalized</strong>.
-            You can ask for a second review if you disagree. Claims that turn out
-            to be fraudulent receive no refund.
+            Claims move through <strong>pending → ruled</strong> in a single
+            pass. The ruling is final and settles immediately — the refund goes
+            to you and the remainder to the operator in the same call. There
+            are no second reviews or appeal rounds.
           </p>
         </aside>
       </section>

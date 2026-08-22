@@ -29,16 +29,19 @@ web-fetched data.
 These three are enforced together, not independently, because a gap in any
 one defeats the others:
 
-1. **Reservation-tied bookings; deterministic settlement.** `book()` requires
-   a `reservation_ref` — the PNR/confirmation code the provider issued when
-   the reservation was actually created off-chain. It anchors the booking to
-   a real off-chain reservation and is the reference the DISPUTE path later
-   verifies against authenticated evidence. Settlement itself is fully
-   deterministic and needs no external input: `settle_booking` (permissionless)
-   pays out once the return date has passed, and `force_complete` (owner-only)
-   settles early as an explicit operator override. No web fetch, no LLM, no
-   consensus block sits between an ordinary booking and verified settlement,
-   so there is nothing to spoof, time out, or disagree about.
+1. **Unforgeable, reservation-tied evidence.** `book()` requires a
+   `reservation_ref` — the PNR the provider issued when the reservation was
+   actually created off-chain. PNRs are HMAC-SHA256 derivations over the exact
+   trip parameters (route + dates) keyed by a server-only secret (`PNR_SECRET`)
+   that never appears on-chain: the contract holds no credentials at all, so
+   nothing in public state can be replayed against the provider feed to forge
+   or alter refund evidence. The dispute path fetches
+   `/status?ref&from&to&depart&ret`, admits only evidence echoing the
+   booking's own ref, and treats everything else as unavailable (full-refund
+   default). Settlement is fully deterministic and needs no external input:
+   `settle_booking` (permissionless) pays out once the return date has passed,
+   and `force_complete` (owner-only) settles early as an explicit operator
+   override.
 2. **Customer-only dispute authorization.** `file_dispute` checks
    `gl.message.sender_address` against `booking["customer"]` before accepting
    a claim — only the person who escrowed the funds for a booking can dispute
@@ -60,7 +63,8 @@ one defeats the others:
 | Threat | Attack | Mitigation |
 |---|---|---|
 | Disputed-price / quote injection | Caller submits a self-serving low price | Quotes are produced inside a non-deterministic consensus block (`gl.vm.run_nondet_unsafe`). Validators independently re-fetch the provider and agree within a 5% tolerance before any state changes. `view_quote` is read-only cache of the agreed value. |
-| Loyalty spoofing / self-confirmation | User marks their own trip complete | `settle_booking`/`force_complete` are the settlement paths, authenticated with a bearer token and checked against the booking's own `reservation_ref` — a generic or unauthenticated read is never accepted as evidence. |
+| Loyalty spoofing / self-confirmation | User settles their own trip early or fabricates completion | Settlement is rule-based: `settle_booking` pays out only after the return date has passed; `force_complete` is owner-only. Loyalty credits are internal — not withdrawable or transferable — so minting them confers no direct GEN. |
+| Refund-evidence forgery via leaked credentials | Attacker reads a bearer token from public contract state and rewrites provider evidence | No credential exists on-chain. Reservation refs are HMACs over the trip parameters keyed by a server-only secret (`PNR_SECRET`); `/status` recomputes the HMAC from the query and answers only on an exact match, so evidence cannot be minted, replayed, or altered from chain data. |
 | Third-party dispute filing | Non-customer files a dispute against someone else's booking to grief it or manufacture a refund path | `file_dispute` requires `gl.message.sender_address == booking["customer"]`; any other caller reverts. |
 | Dispute after settlement | Customer disputes a booking that's already been paid out in full to the provider | `file_dispute` only accepts bookings still in `confirmed` status; `completed`/`disputed`/`resolved` bookings are rejected since there's no escrow left to split. |
 | Escrow stranded / no settlement | Funds sit in the contract forever with no defined recipient | `settle_booking`/`force_complete` and `escalate` all refuse to run until `provider_address` is set, and both pay out to it (full fare, or the post-refund remainder) in the same call that resolves the booking/dispute. |
@@ -71,7 +75,7 @@ one defeats the others:
 | Faulty validator consensus | One malicious leader proposes a bad ruling | `prompt_comparative` re-checks the leader's response within a 10% tolerance and clamps to `[0, price_max]`. Rulings are one-shot: there are no appeal rounds after `escalate` settles. |
 | XSS from web data | Provider page content rendered into DOM unescaped | React escapes by default. The client also validates every value before display and prefers display of numbers (`fmtGwei`) over raw fetched text. No `dangerouslySetInnerHTML`. |
 | Quote-abuse of the LLM pipeline | User hammers `get_quote` from the browser | `getQuote` in the app calls a server-side `/api/quote` proxy (rate-limited), never the contract directly. See `.env.example` `QUOTE_PROXY_RATE_LIMIT`. |
-| Key leakage | Private key or provider bearer token committed or embedded in client bundle | `.env` gitignored; `GENLAYER_PRIVATE_KEY` and the provider auth token touch only `scripts/deploy.py` / owner-only setters server-side; the client bundle uses only the contract address + RPC. |
+| Key leakage | Private key or server secret committed or embedded in client bundle | `.env` gitignored; `GENLAYER_PRIVATE_KEY` and `PNR_SECRET` live only in server-side env; the contract holds no credentials, and the client bundle uses only the contract address + RPC. |
 | Owner compromise / protocol freeze | Admin key lost; need to halt | `pause` / `kill` escape hatches. `kill` is irreversible by design. |
 | Replay / duplicate booking | Same sender re-submits identical booking | `booking_id` includes route + sender + departure; duplicates revert. |
 
@@ -87,33 +91,29 @@ one defeats the others:
 - Provider URLs are placeholders (`api.example-travel-provider.com`). In a
   real deployment the provider endpoint and its response schema must be pinned
   and content-addressed into the suite so evals are reproducible.
-- The provider bearer token is stored on-chain in plaintext
-  (`provider_auth_token`), visible to anyone reading contract storage. This is
-  a known limitation, not a secret-management solution — it authenticates the
-  contract's reads to the provider, it does not hide the token from chain
-  observers. A production deployment should treat it as a low-privilege,
-  rotatable, read-only token scoped to status lookups, never a token with
-  write/booking-creation privileges on the provider's own API.
+- Dispute evidence authenticity rests on HMAC-derived reservation refs keyed
+  by a server-only secret (`PNR_SECRET`): the provider feed verifies refs by
+  recomputation and answers nothing for unknown ones. The trade-off is
+  centralization of that secret on one server — protect it like a key.
 - Dispute rulings are **one-shot**: `escalate` runs the ruling and settles
   both legs (refund + remainder) in the same call; there are no appeal rounds
-  afterward. The pre-ruling rate limit and escalating bond are the only
-  spam/abuse levers.
+  afterward.
 - Loyalty credits (`balance_of`) are an **internal balance**: they accrue from
-  overpayment refunds and completion mints but cannot be withdrawn as GEN or
+  overpayment refunds and settlement mints but cannot be withdrawn as GEN or
   transferred between addresses today. They're an accounting primitive, not a
   token.
 - Completion settlement uses a deterministic date rule rather than live
   carrier evidence: `settle_booking` unlocks strictly after the return date,
   and `force_complete` is an explicit owner override. This trades real-time
   carrier integration for a settlement path with no external dependencies;
-  authenticated evidence still governs the dispute path.
+  HMAC-verified evidence still governs the dispute path.
 
 ## Release checklist
 
 - [ ] Pin the provider API + response schema (reproducible fixture).
-- [ ] Owner calls `set_provider` (payout address) and `set_provider_auth`
-      (bearer token) before any `escalate` dispute traffic —
-      both revert until configured.
+- [ ] Owner calls `set_provider` (payout address) before any settlement or
+      `escalate` dispute traffic — both revert until configured.
+- [ ] Set `PNR_SECRET` on the quote server (server-only; never on-chain).
 - [ ] Replace single owner with multi-sig/time-lock controller.
 - [ ] Server-side `/api/quote` proxy implemented and rate-limited (no direct
       contract calls from the browser in production).

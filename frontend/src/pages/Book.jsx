@@ -284,7 +284,7 @@ export default function Book() {
           <h2>How it works</h2>
           <div className="list-line"><span className="k">Quote</span><span className="v">real-time price</span></div>
           <div className="list-line"><span className="k">Fare</span><span className="v">held safely</span></div>
-          <div className="list-line"><span className="k">Verification</span><span className="v">automatic review</span></div>
+          <div className="list-line"><span className="k">Verification</span><span className="v">deterministic, on-chain</span></div>
           <div className="list-line"><span className="k">Reward</span><span className="v">added automatically</span></div>
           <p style={{ marginTop: 16, color: "var(--ink-soft)", fontSize: "0.9rem" }}>
             Prices are verified automatically — you only ever pay the fare you

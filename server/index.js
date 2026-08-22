@@ -9,13 +9,13 @@
  *   (OmkarCloud Expedia Scraper). No fallback chain, no demo feed.
  * - GET /quote          : plain-JSON alias a GenLayer contract leader can
  *   fetch from `quote_feed`. Same handler, no date param defaults.
- * - POST /api/reserve   : issues a real reservation (PNR) before escrow. The
- *   on-chain book() stores this ref; it is the anchor confirm_completion /
- *   escalate verify against /status evidence.
- * - GET /status         : authenticated completion evidence for the contract's
- *   confirm_completion / escalate consensus blocks. Requires
- *   Authorization: Bearer AGENCY_AUTH_TOKEN (the on-chain provider_auth_token)
- *   and a reservation ref that /api/reserve actually issued; unknown refs 404.
+ * - POST /api/reserve   : issues a deterministic reservation (PNR) before
+ *   escrow. The on-chain book() stores this ref; it is the anchor dispute
+ *   escalation verifies against /status evidence.
+ * - GET /status         : dispute evidence for the contract's escalate
+ *   consensus block. Stateless and unauthenticated by design: the ref is an
+ *   HMAC of the trip parameters over the server-only PNR_SECRET, so a valid
+ *   ref proves issuance without any shared secret; tampered/unknown refs 404.
  *
  * NO MOCK: with no configured provider it returns 503 rather than fabricating
  * a price. Without a usable GEN price (GEN_USD_RATE or CoinGecko) it returns
@@ -30,6 +30,7 @@
 import "dotenv/config";
 import express from "express";
 import rateLimit from "express-rate-limit";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -63,11 +64,15 @@ const WEI_PER_GEN = 10n ** 18n;
 const QUOTE_TTL_MS = Number(process.env.QUOTE_TTL_MS || 30 * 60 * 1000);
 const GEN_TTL_MS = Number(process.env.GEN_TTL_MS || 5 * 60 * 1000);
 const RATE_LIMIT = Number(process.env.QUOTE_PROXY_RATE_LIMIT || 30);
-// Carrier/agency bearer token the contract uses for AUTHENTICATED /status
-// reads (set on-chain by the owner via set_provider_auth()). The /status feed
-// only answers with this token, so a spoofed/unauthenticated page fetch is not
-// accepted as completion/dispute evidence by validators.
-const AGENCY_AUTH_TOKEN = String(process.env.AGENCY_AUTH_TOKEN || "").trim();
+// Server-only secret from which reservation references are derived. NEVER
+// stored on-chain: the contract holds no credentials at all, so nothing in
+// public state can be replayed against this feed. PNRs are HMACs of the trip
+// parameters, which makes them unforgeable without this secret while staying
+// verifiable statelessly (same trip => same ref, forever).
+const PNR_SECRET = String(process.env.PNR_SECRET || process.env.AGENCY_AUTH_TOKEN || "").trim();
+if (!PNR_SECRET) {
+  console.error("[quote-server] WARNING: PNR_SECRET is empty; /status evidence will 404 for every ref.");
+}
 // After the upstream proves itself down (5xx/network/429), skip further
 // upstream calls for this window instead of hot-looping a dead provider.
 const OUTAGE_COOLDOWN_MS = Number(process.env.OUTAGE_COOLDOWN_MS || 30 * 1000);
@@ -118,18 +123,32 @@ function saveReservations() {
 
 loadReservations();
 
-// PNRs are 6-char IATA-style alphanumerics (excluding lookalike chars).
+// PNRs are 6-char IATA-style alphanumerics (excluding lookalike chars),
+// derived as HMAC-SHA256(PNR_SECRET, trip) so they are unforgeable without
+// the server-only secret and verifiable statelessly (same trip => same ref).
 const PNR_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-function newPnr() {
+
+// Canonical trip key: uppercase airports + ISO dates, matching parseRoute's
+// output shape so /api/reserve and /status hash identical strings.
+function pnrKey(from, to, departIso, retIso) {
+  return `${from.toUpperCase()}|${to.toUpperCase()}|${departIso}|${retIso}`;
+}
+
+function pnrFor(from, to, departIso, retIso) {
+  const digest = crypto.createHmac("sha256", PNR_SECRET).update(pnrKey(from, to, departIso, retIso)).digest();
   let pnr = "";
-  const rand = new Uint32Array(1);
   for (let i = 0; i < 6; i++) {
-    crypto.getRandomValues(rand);
-    pnr += PNR_ALPHABET[rand[0] % PNR_ALPHABET.length];
+    pnr += PNR_ALPHABET[digest[i] % PNR_ALPHABET.length];
   }
-  // Collision guard: extremely unlikely, but keep trying for uniqueness.
-  if (cache.reservations.has(pnr)) return newPnr();
   return pnr;
+}
+
+// YYYYMMDD -> ISO; returns null for anything malformed.
+function yyyymmddToIso(s) {
+  const m = /^(\d{4})(\d{2})(\d{2})$/.exec(String(s || "").trim());
+  if (!m) return null;
+  const iso = `${m[1]}-${m[2]}-${m[3]}`;
+  return Number.isNaN(Date.parse(iso)) ? null : iso;
 }
 
 class ApiError extends Error {
@@ -585,63 +604,74 @@ app.get("/health", (_req, res) => {
     omkar: { configured: Boolean(OMKAR.apiKey) },
     outage: Boolean(cache.outageUntil && Date.now() < cache.outageUntil),
     outage_until_ms: cache.outageUntil || null,
-    agency_auth: { configured: Boolean(AGENCY_AUTH_TOKEN) },
+    evidence: { mode: "hmac", secret_configured: Boolean(PNR_SECRET) },
   });
 });
 app.get("/api/quote", quoteLimiter, quoteEndpoint);
 app.get("/quote", quoteLimiter, quoteEndpoint);
 
-// Reservation issue + authenticated completion evidence for the contract's
-// confirm_completion / escalate non-deterministic blocks, which GET
-// `feed_base + "/status?ref=" + reservation_ref` with
-// `Authorization: Bearer <token>`.
+// Reservation evidence for the contract's escalate non-deterministic block,
+// which GETs `feed_base + "/status?ref=…&from=…&to=…&depart=…&ret=…"`.
 //
-// The contract only accepts evidence that is (a) authenticated with the
-// owner-configured bearer token (set_provider_auth) — a spoofed/blank request
-// gets 401 — and (b) tied to a reservation this server actually issued via
-// POST /api/reserve. Unknown refs return 404, so a made-up PNR is never
-// accepted as evidence of completion.
+// Trust model (no shared secrets anywhere near the chain): a reservation ref
+// is HMAC-SHA256(PNR_SECRET, trip) rendered into the 6-char IATA alphabet.
+// PNR_SECRET lives only on this server — it is never stored on-chain, so no
+// one can read it from public contract state and forge or alter refund
+// evidence. /status recomputes the HMAC from the trip parameters in the query
+// and answers ONLY on an exact match; anything else 404s. Verification is
+// stateless, so evidence survives restarts, redeploys, and free-tier
+// spin-downs.
 
 // A confirmed reservation whose return date has passed is completed. The
 // comparison is date-granular (UTC calendar day, not timestamp) so every
 // validator fetching evidence on the same day reads byte-identical bodies —
 // consensus-safe. Explicit overrides ("completed"/"cancelled") always win.
-function effectiveStatus(reservation) {
-  if (reservation.status !== "confirmed") return reservation.status;
+function effectiveStatus(overrideStatus, retIso) {
+  if (overrideStatus && overrideStatus !== "confirmed") return overrideStatus;
   const today = new Date().toISOString().slice(0, 10);
-  return today > reservation.ret ? "completed" : "confirmed";
+  return today > retIso ? "completed" : "confirmed";
 }
 
 app.get("/status", (req, res) => {
-  const auth = req.headers.authorization || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-  if (!AGENCY_AUTH_TOKEN || token !== AGENCY_AUTH_TOKEN) {
-    return res.status(401).json({ error: "unauthorized" });
+  // No Authorization gate: authenticity comes from the HMAC itself. A ref is
+  // only ever valid for ONE exact trip (the params in this query), so a valid
+  // response leaks nothing forgeable and a tampered ref 404s.
+  const from = String(req.query.from || "").trim().toUpperCase();
+  const to = String(req.query.to || "").trim().toUpperCase();
+  const departIso = yyyymmddToIso(req.query.depart) ?? String(req.query.depart || "").trim();
+  const retIso = yyyymmddToIso(req.query.ret) ?? String(req.query.ret || "").trim();
+  if (!IATA_RE.test(from) || !IATA_RE.test(to) || from === to) {
+    return res.status(400).json({ error: "invalid route" });
   }
+  if (!departIso || !retIso || Number.isNaN(Date.parse(departIso)) || Number.isNaN(Date.parse(retIso))) {
+    return res.status(400).json({ error: "invalid dates" });
+  }
+
   const ref = String(req.query.ref || "").trim().toUpperCase();
   if (!ref || !/^[A-Z0-9]{4,12}$/.test(ref)) {
     return res.status(400).json({ error: "invalid reservation ref" });
   }
-  const reservation = cache.reservations.get(ref);
-  if (!reservation) {
+  if (!PNR_SECRET || ref !== pnrFor(from, to, departIso, retIso)) {
+    // Unknown or forged reference — indistinguishable on purpose.
     return res.status(404).json({ error: "unknown reservation" });
   }
-  // Deterministic evidence body: same bytes for every validator, and it
-  // certifies the specific PNR exists with a concrete completion state.
+
+  // Operator override (completed/cancelled) wins; otherwise derive purely
+  // from the return date. Deterministic body: byte-identical for every
+  // validator fetching with the same query on the same UTC day.
+  const overlay = cache.reservations.get(ref);
   return res.json({
-    ref: reservation.ref,
-    route: reservation.route,
-    status: effectiveStatus(reservation), // "confirmed" | "completed" | "cancelled"
-    updated_at: reservation.updatedAt,
+    ref,
+    route: `${from}-${to}`,
+    status: effectiveStatus(overlay?.status, retIso), // "confirmed" | "completed" | "cancelled"
+    updated_at: overlay?.updatedAt ?? null,
   });
 });
 
-// Issue a real reservation (PNR). The frontend POSTs here after a quote and
-// before escrowing on-chain; `book()` on the contract stores the returned ref.
-// Rate-limited to prevent PNR spam. In a production integration this call
-// would go through the carrier/agency booking API instead of being issued
-// directly; the invariant that matters for the contract is that the PNR is
-// issued server-side and is verifiable later via authenticated /status.
+// Issue a reservation reference. Deterministic: booking the same trip twice
+// yields the same PNR, so re-booking after a server wipe self-heals. The
+// record is kept only for operator overrides/audit; verification never reads
+// it. The frontend POSTs here before escrowing on-chain.
 const reserveLimiter = rateLimit({
   windowMs: 60_000,
   limit: 10,
@@ -657,8 +687,12 @@ app.post("/api/reserve", reserveLimiter, (req, res) => {
   const ret = String(req.body?.ret || "").trim();
   try {
     const { from: f, to: t, depart: d, ret: r } = parseRoute({ query: { from, to, depart, ret } });
-    const pnr = newPnr();
-    cache.reservations.set(pnr, {
+    if (!PNR_SECRET) {
+      return res.status(503).json({ error: "reservation service unavailable: PNR_SECRET not configured" });
+    }
+    const pnr = pnrFor(f, t, d, r);
+    const existing = cache.reservations.get(pnr);
+    const record = existing ?? {
       ref: pnr,
       route: `${f}-${t}`,
       depart: d,
@@ -666,9 +700,11 @@ app.post("/api/reserve", reserveLimiter, (req, res) => {
       status: "confirmed",
       createdAt: Date.now(),
       updatedAt: Date.now(),
-    });
+    };
+    cache.reservations.set(pnr, record);
     saveReservations();
-    return res.status(201).json({ ref: pnr, route: `${f}-${t}`, status: "confirmed" });
+    const status = effectiveStatus(record.status, r);
+    return res.status(existing ? 200 : 201).json({ ref: pnr, route: `${f}-${t}`, status });
   } catch (err) {
     const status = err instanceof ApiError ? err.status : 400;
     return res.status(status).json({ error: err.message || "invalid reservation request" });
@@ -676,11 +712,11 @@ app.post("/api/reserve", reserveLimiter, (req, res) => {
 });
 
 // Operator override of a reservation's lifecycle state — the carrier/agency
-// action a real integration would expose. Authenticated with the same bearer
-// token the contract uses for /status reads, so only someone holding
-// AGENCY_AUTH_TOKEN can flip states. "completed" lets a trip settle before
-// its return date (testing/ops); "cancelled" exercises the dispute-refund
-// path. Rate-limited like /api/reserve.
+// action a real integration would expose. Gated by PNR_SECRET, which lives
+// ONLY on this server (never on-chain), so holding it is a genuine operator
+// credential. "completed" lets a trip settle before its return date;
+// "cancelled" exercises the dispute-refund path. Overrides are an overlay:
+// /status still derives from the date rule whenever no override exists.
 const statusLimiter = rateLimit({
   windowMs: 60_000,
   limit: 10,
@@ -692,25 +728,24 @@ const statusLimiter = rateLimit({
 app.post("/api/reservations/:ref/status", statusLimiter, (req, res) => {
   const auth = req.headers.authorization || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-  if (!AGENCY_AUTH_TOKEN || token !== AGENCY_AUTH_TOKEN) {
+  if (!PNR_SECRET || token !== PNR_SECRET) {
     return res.status(401).json({ error: "unauthorized" });
   }
   const ref = String(req.params.ref || "").trim().toUpperCase();
   if (!ref || !/^[A-Z0-9]{4,12}$/.test(ref)) {
     return res.status(400).json({ error: "invalid reservation ref" });
   }
-  const reservation = cache.reservations.get(ref);
-  if (!reservation) {
-    return res.status(404).json({ error: "unknown reservation" });
-  }
   const status = String(req.body?.status || "").trim().toLowerCase();
   if (!["completed", "cancelled"].includes(status)) {
     return res.status(400).json({ error: "status must be 'completed' or 'cancelled'" });
   }
-  reservation.status = status;
-  reservation.updatedAt = Date.now();
+  const existing = cache.reservations.get(ref);
+  const record = existing ?? { ref, createdAt: Date.now(), updatedAt: Date.now() };
+  record.status = status;
+  record.updatedAt = Date.now();
+  cache.reservations.set(ref, record);
   saveReservations();
-  return res.json({ ref: reservation.ref, status });
+  return res.json({ ref, status });
 });
 
 app.use((err, _req, res, _next) => {

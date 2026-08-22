@@ -61,7 +61,6 @@ class TravelAgent(gl.Contract):
     last_dispute_time: TreeMap[Address, u256]
     feed_base: str                     # provider feed root; owner-adjustable
     provider_address: Address          # carrier/agency settlement payout address
-    provider_auth_token: str           # bearer token for authenticated provider reads
 
     def __init__(self, owner: Address):
         # GenVM decodes constructor address args from the raw 20-byte calldata
@@ -80,7 +79,6 @@ class TravelAgent(gl.Contract):
         # TreeMap[K, V] field. Leaving them untouched keeps them at {}.
         self.feed_base = "https://api.example-travel-provider.com"
         self.provider_address = ADMIN_ZERO
-        self.provider_auth_token = ""
 
     # -- Admin ---------------------------------------------------------------
 
@@ -152,19 +150,6 @@ class TravelAgent(gl.Contract):
         self._only_owner()
         self.provider_address = self._normalize_address(address)
 
-    @gl.public.write
-    def set_provider_auth(self, token: str) -> None:
-        """Owner-only: bearer token attached to provider status reads.
-
-        Without this, `escalate` would treat an
-        unauthenticated, spoofable page fetch as evidence. The token ties
-        the read to a real, authenticated carrier/agency session.
-        """
-        self._only_owner()
-        if not isinstance(token, str) or len(token.strip()) < 8:
-            raise gl.vm.UserError("provider auth token too short")
-        self.provider_auth_token = token.strip()
-
     # -- Helpers -------------------------------------------------------------
 
     def _valid_route(self, origin: str, destination: str) -> bool:
@@ -226,16 +211,13 @@ class TravelAgent(gl.Contract):
 
     @gl.public.view
     def view_provider_config(self) -> dict:
-        """Diagnostics: the owner-set settlement + auth configuration. The
-        token is already public on-chain (docs/security.md trade-off), so
-        returning it here leaks nothing new — it makes misconfiguration
-        (wrong/missing bearer token vs the provider's expected value)
-        diagnosable instead of a silent 401 inside a consensus block."""
+        """Diagnostics: the owner-set settlement + feed configuration. No
+        bearer token exists here by design — evidence authenticity comes from
+        unforgeable HMAC-derived reservation references, not shared secrets
+        in public state."""
         return {
             "provider_address": str(self.provider_address),
             "feed_base": self.feed_base,
-            "auth_token": self.provider_auth_token,
-            "auth_configured": self.provider_auth_token != "",
         }
 
     # -- Quote ---------------------------------------------------------------
@@ -513,8 +495,6 @@ class TravelAgent(gl.Contract):
         ref = booking.get("reservation_ref", "")
         if not ref:
             raise gl.vm.UserError("booking has no reservation reference on file")
-        if not self.provider_auth_token:
-            raise gl.vm.UserError("provider authentication not configured: owner must call set_provider_auth")
         if self.provider_address == ADMIN_ZERO:
             raise gl.vm.UserError("provider payout address not configured: owner must call set_provider")
 
@@ -525,26 +505,44 @@ class TravelAgent(gl.Contract):
         # Same nondet-storage rule as refresh_quote: capture
         # the feed root before the closure instead of reading storage inside it.
         feed = self.feed_base
-        token = self.provider_auth_token
+        # Route/dates come from the booking itself so the provider can verify
+        # the reservation reference against them (HMAC-derived refs are bound
+        # to this exact trip — see docs/security.md). No shared secret is sent:
+        # there is deliberately NO bearer token in contract state for anyone
+        # to read and replay.
+        parts = str(booking.get("route", "")).split("-")
+        o, d = parts[0], parts[1]
+        b_depart = int(booking.get("depart", 0))
+        b_ret = int(booking.get("ret", 0))
 
         def get_ruling() -> str:
             try:
                 res = gl.nondet.web.get(
-                    feed + "/status?ref=" + ref,
-                    headers={"Authorization": "Bearer " + token},
+                    feed + "/status?ref=" + ref
+                    + "&from=" + o + "&to=" + d
+                    + "&depart=" + str(b_depart) + "&ret=" + str(b_ret)
                 )
                 if _http_status(res) != 200:
-                    evidence = "provider evidence unavailable (auth/status error)"
+                    evidence = ""
                 else:
-                    evidence = res.body.decode("utf-8")[:2000]
+                    try:
+                        page = json.loads(res.body.decode("utf-8"))
+                    except Exception:
+                        page = None
+                    # Only evidence that echoes THIS reservation's own ref is
+                    # admissible; anything else is treated as unavailable.
+                    if isinstance(page, dict) and str(page.get("ref", "")).strip().upper() == ref.strip().upper():
+                        evidence = json.dumps(page)[:2000]
+                    else:
+                        evidence = ""
             except Exception:
                 evidence = "provider status unavailable"
             return gl.nondet.exec_prompt(
                 "Travity travel dispute for reservation " + ref + ". Reason: " + reason +
                 ". Booking price (wei): " + str(price_max) +
-                ". Authenticated provider evidence: " + evidence +
-                ". If the evidence does not reference reservation " + ref +
-                " or is unavailable, award the full booking price as refund. "
+                ". Provider status evidence: " + (evidence if evidence else "unavailable") +
+                ". If the evidence is unavailable or does not confirm reservation " + ref +
+                ", award the full booking price as refund. "
                 "Otherwise decide a fair refund in integer wei from 0 to " +
                 str(price_max) + ". Reply only with the number."
             )

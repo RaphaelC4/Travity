@@ -25,9 +25,10 @@ services:
         value: "1800000"
       - key: QUOTE_PROXY_RATE_LIMIT
         value: "30"
-      # Bearer token for authenticated /status evidence reads. MUST match the
-      # on-chain provider_auth_token set via the owner panel (set_provider_auth).
-      - key: AGENCY_AUTH_TOKEN
+      # Server-only secret from which reservation refs (PNRs) are derived.
+      # NEVER stored on-chain — the contract holds no credentials. Also gates
+      # the operator override endpoint. Rotate = invalidate existing refs.
+      - key: PNR_SECRET
         sync: false
 
   # ---- Frontend (React + Vite static site; free on Render) ----

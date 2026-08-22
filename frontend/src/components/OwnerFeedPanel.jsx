@@ -39,16 +39,13 @@ export function OwnerFeedPanel() {
 
   const isOwner = wallet.status === "connected" && wallet.account?.toLowerCase() === OWNER.toLowerCase();
 
-  // Provider settlement address + auth token: typed in at runtime, never
-  // baked into the build. An address isn't secret, but the token would be
-  // bundled into the public JS if it ever went through import.meta.env —
-  // both live in local component state only, entered by the owner per
+  // Provider settlement address: typed in at runtime, never baked into the
+  // build. It lives in local component state only, entered by the owner per
   // session. This must stay below the OWNER/isOwner check for hooks order,
   // but the check itself happens after, same as the feed panel below.
   const [providerAddr, setProviderAddr] = useState("");
-  const [providerToken, setProviderToken] = useState("");
   const [providerBusy, setProviderBusy] = useState(false);
-  const [providerDone, setProviderDone] = useState({ addr: false, token: false });
+  const [providerDone, setProviderDone] = useState({ addr: false });
 
   const [reagree, setReagree] = useState({ origin: "", destination: "", depart: "", ret: "" });
   const [reagreeBusy, setReagreeBusy] = useState(false);
@@ -83,20 +80,6 @@ export function OwnerFeedPanel() {
       showToast(`Settlement payout address set to ${pushed}`, "status");
     } catch (err) {
       showToast(err instanceof Error ? err.message : "Could not set provider address.", "alert");
-    } finally {
-      setProviderBusy(false);
-    }
-  }
-
-  async function setProviderAuthToken() {
-    setProviderBusy(true);
-    try {
-      await client.setProviderAuth(providerToken, wallet.account, wallet.provider);
-      setProviderDone((s) => ({ ...s, token: true }));
-      setProviderToken("");
-      showToast("Provider auth token set.", "status");
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : "Could not set provider auth token.", "alert");
     } finally {
       setProviderBusy(false);
     }
@@ -166,14 +149,13 @@ export function OwnerFeedPanel() {
         </div>
 
         <div className="panel" style={{ marginTop: 24 }}>
-          <h2 id="owner-provider-heading">Owner · Settlement &amp; authentication</h2>
+          <h2 id="owner-provider-heading">Owner · Settlement</h2>
           <p style={{ margin: "12px 0", color: "var(--ink-soft)" }}>
             Settlement (<span className="mono">settle_booking</span>/
-            <span className="mono">force_complete</span>) needs the payout
-            address; dispute escalation additionally needs the bearer token on
-            its evidence reads. Neither is bundled from an env var — type them
-            in below, per session, so the auth token never ends up in the
-            public JS build.
+            <span className="mono">force_complete</span>) and dispute payouts
+            require the payout address below. No bearer token is needed
+            anywhere: reservation references are HMAC-derived from a secret
+            that lives only on the quote server, never in contract state.
           </p>
 
           <div className="form-field" style={{ marginTop: 12 }}>
@@ -196,32 +178,6 @@ export function OwnerFeedPanel() {
             style={{ marginTop: 8 }}
           >
             {providerBusy ? "Setting…" : providerDone.addr ? "Payout address set ✓" : "Set payout address"}
-          </button>
-
-          <div className="form-field" style={{ marginTop: 20 }}>
-            <label htmlFor="provider-token">Provider bearer token</label>
-            <input
-              id="provider-token"
-              type="password"
-              value={providerToken}
-              onChange={(e) => setProviderToken(e.target.value)}
-              placeholder="min. 8 characters"
-              autoComplete="off"
-            />
-            <p className="hint" style={{ marginTop: 4 }}>
-              Stored on-chain in plaintext (see docs/security.md) — use a low-privilege, rotatable,
-              status-read-only token, never a token with write access on the provider's own API.
-            </p>
-          </div>
-          <button
-            type="button"
-            className="btn btn-accent"
-            onClick={setProviderAuthToken}
-            disabled={providerBusy || providerToken.trim().length < 8}
-            title="Call set_provider_auth"
-            style={{ marginTop: 8 }}
-          >
-            {providerBusy ? "Setting…" : providerDone.token ? "Auth token set ✓" : "Set auth token"}
           </button>
         </div>
 

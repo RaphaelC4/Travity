@@ -17,11 +17,14 @@ docs/security.md            Threat model + hardening notes
 
 ## Quick start
 
-Contract tests (no GenLayer node required):
+Contract tests run on GenLayer's official runner (genlayer-test Direct Mode):
+contracts execute in the real GenVM — storage, calldata encoding, and
+consensus plumbing included; only external web/LLM responses are simulated.
+No mocks of GenLayer itself.
 
 ```
 pip install -r requirements.txt
-python -m pytest tests -q
+python -m pytest tests -v
 ```
 
 Frontend + quote server (live quotes require a fare-provider key in `server/.env`):

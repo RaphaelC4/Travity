@@ -427,23 +427,6 @@ export class TravityClient {
     return clean;
   }
 
-  /** Owner-only (set_provider_auth). Bearer token sent on every
-   * escalate provider read so evidence is authenticated,
-   * not a public/spoofable fetch. NOTE: this is stored on-chain in
-   * plaintext (see docs/security.md) — treat it as a low-privilege,
-   * rotatable, status-read-only token, never a secret you couldn't afford
-   * to have public. Never put this in a VITE_ env var: anything with that
-   * prefix is bundled into the public JS at build time. */
-  async setProviderAuth(token, account, provider) {
-    const clean = String(token || "").trim();
-    if (clean.length < 8) {
-      throw new Error("Provider auth token must be at least 8 characters.");
-    }
-    const client = await this.writeClient(account, provider);
-    await runWrite(client, { functionName: "set_provider_auth", args: [clean], value: 0n });
-    return true;
-  }
-
   /** Forces the contract to re-fetch and re-agree a live price for a
    * route+dates (public write, but owner panel only). Use after the feed or
    * price source changed so a stale on-chain agreement (e.g. one agreed at an
