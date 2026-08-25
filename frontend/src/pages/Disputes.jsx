@@ -28,7 +28,7 @@ export default function Disputes() {
       const id = await client.fileDispute(bookingId.trim(), trimmed, wallet.account, wallet.provider);
       setDispute({ id, bookingId: bookingId.trim(), reason: trimmed, status: "pending", rounds: 0, refund: null });
       setErrors({});
-      showToast("Dispute filed. We're reviewing it now.");
+      showToast("Dispute filed. Escalate for the final ruling when ready.");
     } catch (err) {
       showToast("Could not file: " + (err.message || "unknown error"), "alert");
     } finally {
@@ -58,7 +58,9 @@ export default function Disputes() {
           <h1>Fast, fair answers</h1>
           <p className="lede">
             File a claim and it's reviewed automatically against your booking
-            details. If it's upheld, your refund is capped at the fare you paid.
+            details. If it's upheld, your refund is capped at the fare you
+            paid. The ruling is one-shot: escalating settles the refund and
+            the remainder immediately, with no further appeals.
           </p>
         </div>
       </section>
@@ -69,7 +71,7 @@ export default function Disputes() {
             <h2>File a dispute</h2>
             <div className="form-field">
               <label htmlFor="bid">Booking reference</label>
-              <input id="bid" value={bookingId} onChange={(e) => setBookingId(e.target.value)} placeholder="JFK-SFO-20261201-20261210-0xc048310B6AD26D7cf35eF068A83CBe6793864Fd1" className="mono" aria-describedby="bid-hint" />
+              <input id="bid" value={bookingId} onChange={(e) => setBookingId(e.target.value)} placeholder="JFK-SFO-20261201-20261210-0xaa11bb22cc33dd44ee55ff66778899aabbccddee" className="mono" aria-describedby="bid-hint" />
             </div>
             <p className="hint" id="bid-hint">Paste the booking id shown after your last successful booking — it ends in your checksummed address.</p>
             <div className={`form-field ${errors.reason ? "is-error" : ""}`}>
@@ -112,7 +114,7 @@ export default function Disputes() {
                   </div>
                 ) : (
                   <button className="btn btn-accent" style={{ marginTop: 16 }} onClick={escalate} disabled={busy}>
-                    Ask for a second review
+                    Escalate for final ruling
                   </button>
                 )
               )}
@@ -123,9 +125,10 @@ export default function Disputes() {
         <aside className="panel" aria-label="How disputes work">
           <h2>Lifecycle</h2>
           <p style={{ color: "var(--ink-soft)", fontSize: "0.9rem", margin: 0 }}>
-            Claims move through <strong>pending → accepted → finalized</strong>.
-            You can ask for a second review if you disagree. Claims that turn out
-            to be fraudulent receive no refund.
+            Claims move through <strong>pending → ruled</strong> in a single
+            pass. The ruling is final and settles immediately — the refund goes
+            to you and the remainder to the operator in the same call. There
+            are no second reviews or appeal rounds.
           </p>
         </aside>
       </section>

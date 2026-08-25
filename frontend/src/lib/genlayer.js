@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Travity -> GenLayer client.
  *
  * Talks to the deployed TravelAgent Intelligent Contract through genlayer-js.
@@ -66,13 +66,13 @@ const persistBookings = (list) => {
 
 const loadBookings = () => {
   try {
-    // Migrate the pre-contract-scoped key (travity.bookings.v1) into this
-    // contract's list so prior trips aren't lost on first load after upgrade.
-    const legacy = JSON.parse(localStorage.getItem("travity.bookings.v1") || "[]");
+    // NOTE: deliberately NO cross-contract migration. Bookings are scoped to
+    // one deployed address; pulling trips from an older deployment here made
+    // them look actionable when the current contract can never resolve their
+    // ids ("unknown booking" revert on disputes).
     const raw = JSON.parse(localStorage.getItem(bookingsKey()) || "[]");
-    const merged = Array.isArray(raw) && raw.length ? raw : legacy;
-    if (!Array.isArray(merged)) return [];
-    return merged.map((b) => ({
+    if (!Array.isArray(raw)) return [];
+    return raw.map((b) => ({
       id: String(b.id || ""),
       onChainId: String(b.onChainId || b.id || ""),
       route: String(b.route || ""),
@@ -81,6 +81,7 @@ const loadBookings = () => {
       priceWei: BigInt(b.priceWei ?? 0n),
       status: String(b.status || "confirmed"),
       completion: Boolean(b.completion),
+      reservationRef: b.reservationRef ? String(b.reservationRef) : "",
     }));
   } catch {
     return [];
@@ -128,6 +129,35 @@ const isValidRoute = (o, d) =>
 const isValidDates = (depart, ret) =>
   Number.isInteger(Number(depart)) && Number.isInteger(Number(ret)) &&
   Number(depart) < Number(ret);
+
+/** A reservation reference is accepted only if it came from the server's
+ * /api/reserve (a 4-12 char uppercase PNR like "9K2F7Q"). It anchors the
+ * escrow to a real, agency-issued reservation — dispute escalation
+ * later verify it against authenticated /status evidence, so a made-up ref
+ * (as would happen if the client generated one) is never treated as proof. */
+const isValidRef = (ref) =>
+  typeof ref === "string" && /^[A-Z0-9]{4,12}$/.test(ref.trim());
+
+/** Issues a real reservation (PNR) at the quote server, returning the ref
+ * the contract will store in `book()`. The ref is the anchor that
+ * dispute escalation verifies against authenticated `/status` evidence —
+ * it cannot be made up, it must come from the agency. */
+async function createReservation({ origin, destination, depart, ret }) {
+  const base = (import.meta.env.VITE_QUOTE_API || "").replace(/\/+$/, "");
+  const res = await fetch(`${base}/api/reserve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      from: String(origin).toUpperCase(),
+      to: String(destination).toUpperCase(),
+      depart: String(depart),
+      ret: String(ret),
+    }),
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(j.error || `Reservation failed (${res.status})`);
+  return String(j.ref || "").toUpperCase();
+}
 
 // ---- live helpers (genlayer-js) ---------------------------------------------
 
@@ -248,13 +278,20 @@ export class TravityClient {
     };
   }
 
-  async book({ origin, destination, depart, ret, paymentWei, account, provider }) {
+  async book({ origin, destination, depart, ret, paymentWei, reservationRef, account, provider }) {
     const o = origin.toUpperCase(), d = destination.toUpperCase();
     const dep = Number(depart), r = Number(ret);
     if (!isValidRoute(o, d)) throw new Error("Invalid route.");
     if (!isValidDates(dep, r)) throw new Error("Return date must be after departure date.");
     const priceWei = BigInt(paymentWei ?? 0n);
     if (priceWei <= 0n) throw new Error("Payment must be greater than zero.");
+    // The contract rejects book() without a real, agency-issued reservation
+    // ref (server /api/reserve). A made-up/client-generated ref is never
+    // accepted as evidence later, so require one here.
+    const ref = isValidRef(reservationRef) ? reservationRef.trim().toUpperCase() : "";
+    if (!ref) {
+      throw new Error("A reservation reference is required. Reserve your seat on the agency first.");
+    }
 
     // Cached on-chain agreement for these exact dates. When present we skip the
     // refresh_quote write entirely: repeat bookings drop to a single write per
@@ -296,7 +333,7 @@ export class TravityClient {
     const client = await this.writeClient(account, provider);
     await runWrite(client, {
       functionName: "book",
-      args: [o, d, dep, r],
+      args: [o, d, dep, r, ref],
       value: bookValue,
     });
     // The contract stores bookings under `_quote_key + "-" + str(sender)`
@@ -308,9 +345,10 @@ export class TravityClient {
     sessionBookings.push({
       id, route: `${o}-${d}`, depart: dep, ret: r,
       priceWei: bookValue, status: "confirmed", completion: false, onChainId,
+      reservationRef: ref,
     });
     persistBookings(sessionBookings);
-    return { id, onChainId, agreedWei: bookValue };
+    return { id, onChainId, agreedWei: bookValue, reservationRef: ref };
   }
 
   /** Rebuilds the contract's booking_id for (route, dates, sender) and confirms
@@ -358,9 +396,86 @@ export class TravityClient {
     return clean;
   }
 
-  async confirmCompletion(bookingId, account, provider) {
+  /** Issues a real reservation (PNR) at the quote server. The returned ref is
+   * required by book() and is later verified against authenticated /status
+   * evidence by dispute escalation. This is the "tied to a real
+   * reservation" anchor — a made-up ref is never accepted as evidence. */
+  async createReservation({ origin, destination, depart, ret }) {
+    return createReservation({ origin, destination, depart, ret });
+  }
+
+  /** Owner-only (set_provider). The carrier/agency settlement payout
+   * address — receives the escrowed fare on verified completion, or the
+   * non-refunded remainder after a dispute ruling. Reverts with
+   * `only owner` if the connected wallet is not the contract owner. */
+  async setProvider(address, account, provider) {
+    const clean = String(address || "").trim();
+    if (!/^0x[0-9a-fA-F]{40}$/.test(clean)) {
+      throw new Error("Provider address must be a 0x-prefixed 20-byte address.");
+    }
     const client = await this.writeClient(account, provider);
-    await runWrite(client, { functionName: "confirm_completion", args: [bookingId], value: 0n });
+    // Address args must be encoded as raw 20 bytes (CalldataAddress) — see
+    // balance(). A plain "0xâ€¦" string is serialized as a string and the
+    // contract's Address parameter decode fails on the storage setter.
+    let who;
+    try {
+      who = new CalldataAddress(fromHex(clean, "bytes"));
+    } catch {
+      who = clean;
+    }
+    await runWrite(client, { functionName: "set_provider", args: [who], value: 0n });
+    return clean;
+  }
+
+  /** Forces the contract to re-fetch and re-agree a live price for a
+   * route+dates (public write, but owner panel only). Use after the feed or
+   * price source changed so a stale on-chain agreement (e.g. one agreed at an
+   * outdated GEN/USD rate) is overwritten instead of continuing to drive the
+   * escrow the frontend pays. Returns the newly agreed price in wei. */
+  async refreshQuote(origin, destination, depart, ret, account, provider) {
+    const o = String(origin || "").toUpperCase();
+    const d = String(destination || "").toUpperCase();
+    const dep = Number(depart), r = Number(ret);
+    if (!isValidRoute(o, d)) throw new Error("Route must be two distinct 3-letter IATA codes.");
+    if (!isValidDates(dep, r)) throw new Error("Return date must be after departure date and both must be YYYYMMDD.");
+    const client = await this.writeClient(account, provider);
+    await runWrite(client, {
+      functionName: "refresh_quote",
+      args: [o, d, dep, r],
+      value: 0n,
+    });
+    const agreed = await this.agreedQuote(o, d, dep, r);
+    return agreed ? agreed.priceWei : null;
+  }
+
+  async settleBooking(bookingId, account, provider) {
+    // Pre-flight: a booking id from an older deployment (or a typo) reverts
+    // on-chain with "unknown booking" and burns gas. Fail here, for free,
+    // with an actionable message instead.
+    const client = await this.writeClient(account, provider);
+    const existing = await runRead(client, "view_booking", [bookingId]);
+    if (!existing || Object.keys(existing).length === 0) {
+      throw new Error(
+        "This booking does not exist on the current contract — it was made on a previous deployment. Book again on this contract, then settle."
+      );
+    }
+    await runWrite(client, { functionName: "settle_booking", args: [bookingId], value: 0n });
+    const b = sessionBookings.find((x) => x.id === bookingId);
+    if (b) { b.status = "completed"; b.completion = true; persistBookings(sessionBookings); }
+    return "completed";
+  }
+
+  async forceComplete(bookingId, account, provider) {
+    // Owner-only operator override: settles without waiting for the return
+    // date. Same pre-flight check as settleBooking.
+    const client = await this.writeClient(account, provider);
+    const existing = await runRead(client, "view_booking", [bookingId]);
+    if (!existing || Object.keys(existing).length === 0) {
+      throw new Error(
+        "This booking does not exist on the current contract — it was made on a previous deployment."
+      );
+    }
+    await runWrite(client, { functionName: "force_complete", args: [bookingId], value: 0n });
     const b = sessionBookings.find((x) => x.id === bookingId);
     if (b) { b.status = "completed"; b.completion = true; persistBookings(sessionBookings); }
     return "completed";
@@ -416,7 +531,7 @@ export class TravityClient {
     if (!account) return 0n;
     const client = this.readClient();
     // Address args must be encoded as raw 20 bytes (CalldataAddress) — passing
-    // a plain "0x…" string makes genlayer-js serialize it as a string and the
+    // a plain "0xâ€¦" string makes genlayer-js serialize it as a string and the
     // contract's Address parameter read fails ("Missing or invalid parameters").
     let who;
     try {

@@ -1,7 +1,8 @@
 # Travity
 
 Travity is a GenLayer-powered travel agent: live web fares, escrowed GEN
-payments, on-chain loyalty rewards, and AI-adjudicated disputes.
+payments, on-chain loyalty credit accounting, and AI-adjudicated one-shot
+dispute refunds.
 
 ## Layout
 
@@ -16,11 +17,14 @@ docs/security.md            Threat model + hardening notes
 
 ## Quick start
 
-Contract tests (no GenLayer node required):
+Contract tests run on GenLayer's official runner (genlayer-test Direct Mode):
+contracts execute in the real GenVM — storage, calldata encoding, and
+consensus plumbing included; only external web/LLM responses are simulated.
+No mocks of GenLayer itself.
 
 ```
 pip install -r requirements.txt
-python -m pytest tests -q
+python -m pytest tests -v
 ```
 
 Frontend + quote server (live quotes require a fare-provider key in `server/.env`):
@@ -77,12 +81,14 @@ sources.
    on Studionet via `genlayer-js`.
 
 Deployed contract (Studionet):
-`0xE4f0DCcaA3Cdd79af72B32068311D478F8728CFa`
+`0x3D3F1dd4fe7f044DBA73BE7A434603282638965C`
 
 The contract intentionally exposes: `refresh_quote` (web price via validator
-consensus), `book` (payable escrow + overpayment credit), `confirm_completion`
-(owner-only, web-verified loyalty mint), `file_dispute` / `escalate`
-(AI-adjudicated refund with appeals), and `balance_of`.
+consensus), `book` (payable escrow + overpayment credit), `settle_booking`
+(permissionless deterministic settlement once the return date passes) and
+`force_complete` (owner override), `file_dispute` / `escalate` (one-shot
+AI-adjudicated refund), `balance_of` (internal loyalty-credit balance — not
+withdrawable or transferable), and `view_provider_config`.
 
 ## Security
 

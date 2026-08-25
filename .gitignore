@@ -32,3 +32,5 @@ Thumbs.db
 
 # Local opencode configuration / skills (not part of the product)
 .opencode/
+# Runtime reservation overlay/audit state
+server/data/

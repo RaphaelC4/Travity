@@ -1,6 +1,21 @@
-# Render blueprint — deploy the Travity quote server
+# Render blueprint — Travity quote server + frontend static site.
 # https://dashboard.render.com/blueprints from the repo root picks this up.
 services:
+   # ---- Quote server (Express, fare -> GEN, /api/reserve + /status) ----
+  - type: web
+    name: travity-booking-provider
+    runtime: node
+    rootDir: booking-provider
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 3001
+      - key: BOOKING_PROVIDER_SECRET
+        sync: false
+
   - type: web
     name: travity-server
     runtime: node
@@ -17,10 +32,61 @@ services:
       - key: RAPID_API_KEY
         sync: false
       - key: GEN_USD_RATE
-        value: "1.5"
+        value: "200"
       - key: GEN_TTL_MS
         value: "300000"
       - key: QUOTE_TTL_MS
         value: "1800000"
       - key: QUOTE_PROXY_RATE_LIMIT
         value: "30"
+      # Server-only secret for HMAC refs when no external booking provider is
+      # configured — kept only as fallback so local dev/harness stay green.
+      - key: PNR_SECRET
+        sync: false
+      # Actual provider transaction: the server POSTs the trip to this URL and
+      # stores the returned locator as the booking's reservation_ref. In
+      # production this points at travity-booking-provider; in local dev leave
+      # empty to use the HMAC fallback.
+      - key: BOOKING_PROVIDER_URL
+        value: https://travity-booking-provider.onrender.com/book
+      - key: BOOKING_PROVIDER_API_KEY
+        sync: false
+      # Independent carrier-status source for refund evidence (Aviationstack).
+      # When set, /provider-status enriches the HMAC/date-derived status with
+      # flight_status from an unaffiliated API.
+      - key: AVIATIONSTACK_KEY
+        sync: false
+
+  # ---- Frontend (React + Vite static site; free on Render) ----
+  # VITE_* vars are baked into the bundle at BUILD time — changing one here or
+  # in the dashboard requires a new deploy to take effect.
+  - type: web
+    name: travity-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_GENLAYER_RPC
+        value: https://studio.genlayer.com/api
+      - key: VITE_GENLAYER_CONTRACT_ADDRESS
+        value: 0x3D3F1dd4fe7f044DBA73BE7A434603282638965C
+      - key: VITE_GENLAYER_CHAIN_ID
+        value: "61999"
+      # Public quote server origin — also the on-chain feed root set via
+      # set_feed_url. Must stay in sync with VITE_QUOTE_API semantics.
+      - key: VITE_QUOTE_API
+        value: https://travity-server.onrender.com
+      # Contract owner address — shows the owner admin panel when this wallet
+      # is connected. Public by nature (it's an on-chain address).
+      - key: VITE_GENLAYER_OWNER_ADDRESS
+        sync: false
+      # Optional: WalletConnect project id (cloud.walletconnect.com). Leave
+      # unset to fall back to an injected wallet extension.
+      - key: VITE_WC_PROJECT_ID
+        sync: false
+    # SPA routing: let react-router handle /book, /disputes, etc.
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html

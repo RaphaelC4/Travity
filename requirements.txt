@@ -1,2 +1,5 @@
-# Contract tests run against a mocked `gl` module (no GenLayer node needed).
+# Integration tests run on GenLayer's official runner (genlayer-test Direct
+# Mode): contracts execute in the real GenVM; only external web/LLM responses
+# are simulated. No mocks of GenLayer itself.
 pytest>=8.0
+genlayer-test>=0.29.2

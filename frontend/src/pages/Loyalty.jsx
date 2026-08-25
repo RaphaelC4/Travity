@@ -37,10 +37,10 @@ export default function Loyalty() {
       <section className="app-hero">
         <div className="container">
           <p className="eyebrow">Loyalty</p>
-          <h1>Rewards you can actually keep</h1>
+          <h1>Credits that add up</h1>
           <p className="lede">
-            Every completed trip adds rewards to your account. No expiry dates,
-            no hidden terms — just a balance that's always current.
+            Every settled trip and every overpayment refund adds credits to
+            your on-chain account automatically.
           </p>
         </div>
       </section>
@@ -55,7 +55,7 @@ export default function Loyalty() {
             <p style={{ color: "var(--ink-soft)", margin: 0, fontSize: "0.9rem" }}>
               {live && status !== "connected"
                 ? "Connect a wallet to read your balance."
-                : "Rewards are added when a trip's completion is verified."}
+                : "Credits accrue when a trip settles or you overpay (the difference is credited)."}
             </p>
           </div>
 
@@ -87,10 +87,12 @@ export default function Loyalty() {
         </div>
 
         <aside className="panel" aria-label="Loyalty notes">
-          <h2>Note</h2>
+          <h2>How credits work</h2>
           <p style={{ color: "var(--ink-soft)", fontSize: "0.9rem", margin: 0 }}>
-            Your balance is read live from the network — always current,
-            always yours.
+            Credits are an internal balance recorded on the contract. Today
+            they can't be withdrawn as GEN or transferred between wallets —
+            they're a per-account accounting of your completed trips and
+            overpayment refunds, read live from the network.
           </p>
         </aside>
       </section>

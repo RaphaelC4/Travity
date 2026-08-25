@@ -105,16 +105,24 @@ export default function Book() {
     if (!quote) return;
     setBusy(true);
     try {
+      // A reservation must exist at the agency before escrow: the PNR returned
+      // here is the anchor dispute escalation verifies against authenticated
+      // /status evidence. It cannot be made up by the client.
+      const reservationRef = await client.createReservation({
+        origin: form.origin, destination: form.destination,
+        depart: form.depart, ret: form.ret,
+      });
       const res = await client.book({
         origin: form.origin, destination: form.destination,
         depart: form.depart, ret: form.ret,
         paymentWei: quote.escrowWei.toString(),
+        reservationRef,
         account: wallet.account,
         provider: wallet.provider,
       });
-      setBooking({ id: res.id, route: quote.route, priceWei: res.agreedWei });
+      setBooking({ id: res.id, route: quote.route, priceWei: res.agreedWei, reservationRef: res.reservationRef });
       setQuote(null);
-      showToast("Trip booked: fare escrowed at the on-chain agreed price (network gas was charged separately).", "status");
+      showToast(`Trip booked (PNR ${reservationRef}): fare escrowed at the on-chain agreed price (network gas was charged separately).`, "status");
     } catch (err) {
       showToast("Booking failed: " + (err.message || "unknown error"), "alert");
     } finally {
@@ -126,11 +134,19 @@ export default function Book() {
     if (!booking) return;
     setBusy(true);
     try {
-      await client.confirmCompletion(booking.id, wallet.account, wallet.provider);
+      // Deterministic settlement: succeeds once the return date has passed.
+      // No evidence fetch, no consensus — the contract applies a fixed rule.
+      await client.settleBooking(booking.id, wallet.account, wallet.provider);
       setBooking((b) => ({ ...b, done: true }));
-      showToast("Trip verified. Loyalty credits minted to your wallet.", "status");
+      showToast("Trip settled: fare paid to the operator and loyalty credits minted to your wallet.", "status");
     } catch (err) {
-      showToast("Verification failed: " + (err.message || "unknown error"), "alert");
+      const msg = err?.message || "unknown error";
+      showToast(
+        /return date/i.test(msg)
+          ? "Settlement unlocks the day after your return date."
+          : "Settlement failed: " + msg,
+        "alert"
+      );
     } finally {
       setBusy(false);
     }
@@ -234,14 +250,22 @@ export default function Book() {
             {booking && (
               <div role="status" style={{ marginTop: 16 }}>
                 <div className="list-line"><span className="k">Booking</span><span className="v mono">{booking.id}</span></div>
+                {booking.reservationRef && (
+                  <div className="list-line"><span className="k">Reservation ref</span><span className="v mono">{booking.reservationRef}</span></div>
+                )}
                 <div className="list-line"><span className="k">Status</span><span className="v"><span className="pill pill-accepted">CONFIRMED</span></span></div>
                 {!booking.done ? (
                   needsWallet ? (
-                    <WalletButton label="Connect to verify trip" onError={(m) => showToast(m, "alert")} />
+                    <WalletButton label="Connect to settle trip" onError={(m) => showToast(m, "alert")} />
                   ) : (
-                    <button className="btn btn-secondary" style={{ marginTop: 16 }} onClick={verifyTrip} disabled={busy}>
-                      Verify completed trip
-                    </button>
+                    <>
+                      <button className="btn btn-secondary" style={{ marginTop: 16 }} onClick={verifyTrip} disabled={busy}>
+                        Settle completed trip
+                      </button>
+                      <p className="hint" style={{ marginTop: 6 }}>
+                        Settlement unlocks the day after your return date — the contract applies a fixed rule, no review needed.
+                      </p>
+                    </>
                   )
                 ) : (
                   <div className="list-line"><span className="k">Rewards</span><span className="v">Loyalty minted</span></div>
@@ -260,7 +284,7 @@ export default function Book() {
           <h2>How it works</h2>
           <div className="list-line"><span className="k">Quote</span><span className="v">real-time price</span></div>
           <div className="list-line"><span className="k">Fare</span><span className="v">held safely</span></div>
-          <div className="list-line"><span className="k">Verification</span><span className="v">automatic review</span></div>
+          <div className="list-line"><span className="k">Verification</span><span className="v">deterministic, on-chain</span></div>
           <div className="list-line"><span className="k">Reward</span><span className="v">added automatically</span></div>
           <p style={{ marginTop: 16, color: "var(--ink-soft)", fontSize: "0.9rem" }}>
             Prices are verified automatically — you only ever pay the fare you
