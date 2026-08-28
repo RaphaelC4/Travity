@@ -185,7 +185,33 @@ async function createBookingViaProvider(from, to, departIso, retIso) {
     const locator = String(j.locator ?? j.ref ?? j.pnr ?? j.id ?? "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
     if (!locator || locator.length < 4) return null;
     const flightIata = String(j.flightIata ?? j.flight ?? `${from}${(j.number ?? "")}`).trim().toUpperCase() || `${from}123`;
-    return { locator, flightIata, flightDate: departIso };
+    return {
+      locator,
+      flightIata,
+      flightDate: departIso,
+      providerOrderId: j.duffelOrderId ?? null,
+      refundPolicy: j.refundPolicy ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Live re-verification at dispute time: asks the booking-provider to re-fetch
+// the order straight from the carrier/agency (Duffel) rather than trusting
+// this server's own persisted copy of what it was told at booking time. Only
+// works when the booking actually has a providerOrderId (a real transaction,
+// not the HMAC dev fixture) — anything else has no independent source to
+// re-check and falls through to the date-rule/Aviationstack evidence below.
+async function liveOrderStatus(providerOrderId) {
+  if (!providerOrderId || !BOOKING_PROVIDER_URL) return null;
+  try {
+    const base = BOOKING_PROVIDER_URL.replace(/\/book\/?$/, "");
+    const res = await fetch(`${base}/order-status?orderId=${encodeURIComponent(providerOrderId)}`, {
+      headers: BOOKING_PROVIDER_API_KEY ? { Authorization: `Bearer ${BOOKING_PROVIDER_API_KEY}` } : {},
+    });
+    if (!res.ok) return null;
+    return await res.json();
   } catch {
     return null;
   }
@@ -765,6 +791,8 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
       }
       pnr = real.locator;
       bindingFlights = [{ flightIata: real.flightIata, flightDate: real.flightDate }];
+      var providerOrderId = real.providerOrderId ?? null;
+      var refundPolicy = real.refundPolicy ?? null;
     } catch (e) {
       return res.status(502).json({ error: `booking provider error: ${e.message}` });
     }
@@ -776,7 +804,8 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
       ret: r,
       provider: "booking-provider",
       flights: bindingFlights ?? [],
-      flights: bindingFlights ?? [],
+      providerOrderId: providerOrderId ?? null,
+      refundPolicy: refundPolicy ?? null,
       status: "confirmed",
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -789,6 +818,8 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
     if (!record.flights || !record.flights.length) {
       record.flights = bindingFlights;
     }
+    if (!record.providerOrderId && providerOrderId) record.providerOrderId = providerOrderId;
+    if (!record.refundPolicy && refundPolicy) record.refundPolicy = refundPolicy;
     cache.reservations.set(pnr, record);
     saveReservations();
     const status = effectiveStatus(record.status, r);
@@ -827,10 +858,24 @@ app.get("/provider-status", async (req, res) => {
   const effectiveRet = binding.ret || retIso;
   const overlayStatus = binding.status;
   let derived = effectiveStatus(overlayStatus, effectiveRet);
+  let refundPolicy = binding.refundPolicy ?? null;
+  let source = "date-rule";
 
-  // Independent source enrichment (does not gate the response — even on
-  // failure we return the date-derived status, which the contract treats as
-  // admissible evidence with a stated source).
+  // Primary evidence: re-fetch the order live from the carrier/agency
+  // (Duffel) at dispute time, through the booking-provider's /order-status.
+  // This is the "independently verifiable receipt" the review asked for —
+  // it does not trust this server's own cached copy of what happened at
+  // booking time, and it carries the fare's actual refund/cancellation
+  // conditions, not just a confirmed/completed/cancelled flag.
+  const live = await liveOrderStatus(binding.providerOrderId);
+  if (live && live.source === "duffel-live") {
+    derived = live.status === "cancelled" ? "cancelled" : derived;
+    refundPolicy = live.refundPolicy ?? refundPolicy;
+    source = "duffel-live";
+  }
+
+  // Secondary, unaffiliated flight-status enrichment (does not gate the
+  // response — even on failure we return the primary evidence above).
   let aviation = null;
   const flightIata = binding.flights?.[0]?.flightIata;
   const flightDate = binding.flights?.[0]?.flightDate;
@@ -838,9 +883,10 @@ app.get("/provider-status", async (req, res) => {
     const av = await fetchAviationStatus(flightIata, flightDate);
     if (av) {
       aviation = { flight_status: av.flight_status, departure: av.departure, arrival: av.arrival };
-      // Cancelled/diverted from independent source overrides date rule
-      if (av.flight_status === "cancelled" || av.flight_status === "diverted" || av.flight_status === "incident") {
+      if (source !== "duffel-live" &&
+        (av.flight_status === "cancelled" || av.flight_status === "diverted" || av.flight_status === "incident")) {
         derived = "cancelled";
+        source = "aviationstack";
       }
     }
   }
@@ -849,8 +895,9 @@ app.get("/provider-status", async (req, res) => {
     ref,
     route: binding.route,
     status: derived,
+    refund_policy: refundPolicy,
     aviation,
-    source: aviation ? "aviationstack" : "date-rule",
+    source,
     updated_at: binding.updatedAt ?? null,
   });
 });
