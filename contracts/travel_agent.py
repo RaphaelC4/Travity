@@ -524,6 +524,7 @@ class TravelAgent(gl.Contract):
                 )
                 if _http_status(res) != 200:
                     evidence = ""
+                    policy_note = ""
                 else:
                     try:
                         page = json.loads(res.body.decode("utf-8"))
@@ -533,17 +534,40 @@ class TravelAgent(gl.Contract):
                     # admissible; anything else is treated as unavailable.
                     if isinstance(page, dict) and str(page.get("ref", "")).strip().upper() == ref.strip().upper():
                         evidence = json.dumps(page)[:2000]
+                        # The fare's own refund/cancellation conditions, fetched
+                        # live from the carrier/agency (not asserted by either
+                        # party) — this is what grounds the refund NUMBER, as
+                        # opposed to the status field which only grounds
+                        # whether the trip happened at all.
+                        rp = page.get("refund_policy") if isinstance(page.get("refund_policy"), dict) else None
+                        src = str(page.get("source", "")).strip()
+                        if rp and rp.get("refundable") in ("refundable", "non_refundable"):
+                            penalty = rp.get("penalty")
+                            policy_note = (
+                                "Fare refund policy (source: " + (src or "unknown") + "): " +
+                                str(rp.get("refundable")) +
+                                (", cancellation penalty " + str(penalty) if penalty else "") + "."
+                            )
+                        else:
+                            policy_note = "Fare refund policy: not available from the provider."
                     else:
                         evidence = ""
+                        policy_note = ""
             except Exception:
                 evidence = "provider status unavailable"
+                policy_note = ""
             return gl.nondet.exec_prompt(
                 "Travity travel dispute for reservation " + ref + ". Reason: " + reason +
                 ". Booking price (wei): " + str(price_max) +
                 ". Provider status evidence: " + (evidence if evidence else "unavailable") +
-                ". If the evidence is unavailable or does not confirm reservation " + ref +
+                ". " + (policy_note if policy_note else "Fare refund policy: not available.") +
+                " If the status evidence is unavailable or does not confirm reservation " + ref +
                 ", award the full booking price as refund. "
-                "Otherwise decide a fair refund in integer wei from 0 to " +
+                "Otherwise weigh the dispute reason against the fare's actual refund policy above: "
+                "if the policy marks the fare non_refundable and no carrier fault (cancellation/major "
+                "schedule change) is evidenced, the refund should be at or near the stated cancellation "
+                "penalty rather than the full price; if refundable or evidence shows carrier fault, "
+                "award accordingly. Decide a fair refund in integer wei from 0 to " +
                 str(price_max) + ". Reply only with the number."
             )
 
