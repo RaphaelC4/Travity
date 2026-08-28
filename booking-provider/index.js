@@ -90,6 +90,9 @@ app.post("/book", limiter, async (req, res) => {
       const offerJson = await offerReq.json();
       const offer = offerJson.data?.offers?.[0] ?? offerJson.data?.offer_requests?.[0]?.offers?.[0];
       if (!offer?.id) throw new Error("Duffel returned no offers for route/date");
+      if (!offer.total_amount || !offer.total_currency) {
+        throw new Error("Duffel offer missing total_amount/total_currency");
+      }
 
       const orderRes = await fetch("https://api.duffel.com/air/orders", {
         method: "POST",
@@ -100,9 +103,15 @@ app.post("/book", limiter, async (req, res) => {
         },
         body: JSON.stringify({
           data: {
-            type: "order",
+            type: "instant",
             selected_offers: [offer.id],
             passengers: [{ id: offer.passengers?.[0]?.id ?? "pas_00000000000000", given_name: "John", family_name: "Doe", born_on: "1990-01-01", gender: "m", title: "mr", email: "john.doe@example.com", phone_number: "+14155551234" }],
+            // Duffel requires payment on order creation itself, not a
+            // separate call — pays from your Duffel balance (auto-funded
+            // in test mode; must be topped up for live mode). Amount/
+            // currency must exactly match the offer's own total, or Duffel
+            // rejects it as a price mismatch.
+            payments: [{ type: "balance", amount: offer.total_amount, currency: offer.total_currency }],
           },
         }),
       });
