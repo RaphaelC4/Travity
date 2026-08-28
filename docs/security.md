@@ -29,16 +29,27 @@ web-fetched data.
 These three are enforced together, not independently, because a gap in any
 one defeats the others:
 
-1. **Unforgeable, reservation-tied evidence.** `book()` requires a
-   `reservation_ref` — the PNR the provider issued when the reservation was
-   actually created off-chain. PNRs are HMAC-SHA256 derivations over the exact
-   trip parameters (route + dates) keyed by a server-only secret (`PNR_SECRET`)
-   that never appears on-chain: the contract holds no credentials at all, so
-   nothing in public state can be replayed against the provider feed to forge
-   or alter refund evidence. The dispute path fetches
-   `/status?ref&from&to&depart&ret`, admits only evidence echoing the
-   booking's own ref, and treats everything else as unavailable (full-refund
-   default). Settlement is fully deterministic and needs no external input:
+1. **Real carrier/agency transaction, not a project-issued reference.**
+   `book()` requires a `reservation_ref` — the booking reference the
+   *carrier/agency* issued when the reservation was actually created
+   off-chain. `booking-provider/` transacts with Duffel (an IATA-accredited
+   aggregator): `POST /book` creates a real Duffel order and returns its
+   `booking_reference`. There is no silent fallback to a project-generated
+   reference — without `DUFFEL_API_KEY` the service refuses the booking
+   (503) rather than mint an HMAC placeholder; the only way to opt into
+   the HMAC fixture is `ALLOW_HMAC_DEV_FALLBACK=true`, which is never set
+   in `render.yaml`/`railway.json`, so nothing deployed can produce one.
+   The dispute path fetches `/provider-status?ref&from&to&depart&ret` from
+   `travity-server`, which re-verifies the order **live against Duffel**
+   (`GET /order-status`, keyed off the stored `duffelOrderId`) rather than
+   trusting its own cached copy — an independently re-checkable receipt,
+   not project-controlled state. That response also carries the fare's own
+   refund/cancellation policy (`refund_policy`: refundable/non_refundable +
+   penalty), pulled from the same live Duffel lookup, so the dispute ruling
+   is grounded in the fare's actual terms instead of an unconstrained
+   guess. Evidence that doesn't echo the booking's own ref, or that can't
+   be reached at all, is treated as unavailable (full-refund default).
+   Settlement is fully deterministic and needs no external input:
    `settle_booking` (permissionless) pays out once the return date has passed,
    and `force_complete` (owner-only) settles early as an explicit operator
    override.
@@ -61,12 +72,16 @@ one defeats the others:
 ### Requirement mapping
 
 - **Authenticated carrier/agency evidence tied to a real reservation** —
-  reservation references are `HMAC-SHA256(PNR_SECRET, route|depart|ret)`
-  rendered into a 6-char alphabet by the agency server (`server/index.js`,
-  `pnrFor()`). `/status` recomputes the HMAC from the query parameters and
-  answers only on an exact match, so every piece of admitted evidence is tied
-  to a reservation the agency actually issued and cannot be forged without
-  the server-only secret. No credentials exist anywhere in contract state.
+  `reservation_ref` is the `booking_reference` from a real Duffel order
+  (`booking-provider/index.js`); the service refuses to book at all when
+  `DUFFEL_API_KEY` is missing rather than substitute a project-generated
+  reference. `/provider-status` re-verifies the order **live** against
+  Duffel via `/order-status` (keyed off the stored `duffelOrderId`) and
+  returns the fare's actual `refund_policy`, so evidence is an
+  independently re-checkable carrier-side lookup — not a value this project
+  minted and cached — and the dispute ruling is grounded in the fare's real
+  refund terms instead of an unconstrained guess. No credentials exist
+  anywhere in contract state.
 - **Customer-only dispute authorization** — `file_dispute` reverts unless
   `gl.message.sender_address == booking["customer"]`; enforced on-chain and
   proven by `tests/test_travel_agent_glsim.py::test_only_customer_can_dispute`
@@ -111,10 +126,15 @@ one defeats the others:
 - Provider URLs are placeholders (`api.example-travel-provider.com`). In a
   real deployment the provider endpoint and its response schema must be pinned
   and content-addressed into the suite so evals are reproducible.
-- Dispute evidence authenticity rests on HMAC-derived reservation refs keyed
-  by a server-only secret (`PNR_SECRET`): the provider feed verifies refs by
-  recomputation and answers nothing for unknown ones. The trade-off is
-  centralization of that secret on one server — protect it like a key.
+- Dispute evidence authenticity rests on a live re-fetch from Duffel keyed
+  by `duffelOrderId`, brokered through `booking-provider/` and
+  `DUFFEL_API_KEY`: the trade-off is centralization on one aggregator
+  account and its API key — protect it like a key, and note that Duffel
+  itself, not this project, is the source of truth being trusted. The
+  legacy HMAC path remains in the code only as an explicit,
+  non-default local-test fixture (`ALLOW_HMAC_DEV_FALLBACK=true`); it is
+  never reachable from a deployed configuration and carries no refund-policy
+  evidence when used.
 - Dispute rulings are **one-shot**: `escalate` runs the ruling and settles
   both legs (refund + remainder) in the same call; there are no appeal rounds
   afterward.
