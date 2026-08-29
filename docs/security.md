@@ -4,6 +4,29 @@ Threat model and hardening rationale. The contract is the security boundary
 that matters; the frontend is where injection and abuse enter through user and
 web-fetched data.
 
+## Deployment mode: Duffel test mode
+
+The instance covered by this document runs with a `duffel_test_` access
+token, not a `duffel_live_` one. This is a disclosed, deliberate choice, not
+an oversight:
+
+- Booking-provider transactions go through Duffel Airways' sandbox — the
+  order objects, `booking_reference`, `duffelOrderId`, and `conditions`
+  (refund policy) returned are real Duffel API responses with the same
+  shape and mechanics live mode would return, but no real airline or money
+  is involved.
+- The trust properties this build relies on — an independently re-checkable
+  order (`GET /order-status` re-fetching live from Duffel) and refund-policy
+  evidence pulled from that same live lookup — hold identically in test and
+  live mode, because both call the real Duffel API rather than anything
+  project-controlled.
+- What test mode does NOT prove: that a real commercial airline honored a
+  real reservation. Switching to a `duffel_live_` token (and a funded
+  balance or Duffel Payments integration) is a config change only — no code
+  in `booking-provider/` or `server/` is test-mode-specific — but it has not
+  been exercised end-to-end against a live carrier as part of this
+  submission.
+
 ## Scope
 
 - `contracts/travel_agent.py` — Python Intelligent Contract on GenLayer.
@@ -17,8 +40,10 @@ web-fetched data.
   internal contract balance, not withdrawable or transferable (see
   trade-offs below).
 - Live price quotes culled from a single provider API (RapidAPI google-flights2
-  by default; Kiwi.com Tequila or OmkarCloud Expedia are valid alternatives —
-  one selected via `QUOTE_PROVIDER`). No fallback chain, no demo/polyfill feed:
+  by default; Kiwi.com Tequila, OmkarCloud Expedia, or Duffel offer_requests
+  are valid alternatives — one selected via `QUOTE_PROVIDER`). Kiwi's Tequila
+  API has been invitation-only for new partners since May 2024 and is only
+  usable if you already hold partner credentials. No fallback chain, no demo/polyfill feed:
   an unhealthy provider surfaces as a 503 / stale-marked quote, never a
   fabricated or substituted price.
 - Dispute refund rulings (value-bearing, one-shot — see trade-offs below).
