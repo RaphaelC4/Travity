@@ -47,16 +47,27 @@ const RAPID = {
   host: process.env.RAPID_API_HOST || "google-flights2.p.rapidapi.com",
   apiKey: process.env.RAPID_API_KEY || "",
 };
+const DUFFEL_QUOTE_KEY = String(process.env.DUFFEL_API_KEY || "").trim();
 // Exactly one provider. `rapid` uses RapidAPI google-flights2 (real Google
-// Flights fares); `kiwi` uses Kiwi.com Tequila; `omkarcloud` uses the
-// OmkarCloud Expedia scraper. Anything else is rejected at boot.
+// Flights fares); `kiwi` uses Kiwi.com Tequila (invite-only as of 2024 —
+// only viable if you already hold partner credentials); `omkarcloud` uses
+// the OmkarCloud Expedia scraper; `duffel` uses Duffel's own offer_requests
+// endpoint — the same account/key already used for real bookings in
+// booking-provider/, so a working DUFFEL_API_KEY means one fewer third-party
+// dependency to keep alive. Anything else is rejected at boot.
 const QUOTE_PROVIDER = String(process.env.QUOTE_PROVIDER || "rapid").toLowerCase();
-if (!["rapid", "kiwi", "omkarcloud"].includes(QUOTE_PROVIDER)) {
-  throw new Error(`QUOTE_PROVIDER must be one of 'rapid'|'kiwi'|'omkarcloud', got '${QUOTE_PROVIDER}'`);
+if (!["rapid", "kiwi", "omkarcloud", "duffel"].includes(QUOTE_PROVIDER)) {
+  throw new Error(`QUOTE_PROVIDER must be one of 'rapid'|'kiwi'|'omkarcloud'|'duffel', got '${QUOTE_PROVIDER}'`);
 }
-const ACTIVE = QUOTE_PROVIDER === "rapid" ? RAPID : QUOTE_PROVIDER === "kiwi" ? KIWI : OMKAR;
+const ACTIVE = QUOTE_PROVIDER === "rapid" ? RAPID
+  : QUOTE_PROVIDER === "kiwi" ? KIWI
+  : QUOTE_PROVIDER === "duffel" ? { apiKey: DUFFEL_QUOTE_KEY, host: "api.duffel.com" }
+  : OMKAR;
 const ACTIVE_KEY_ENV =
-  QUOTE_PROVIDER === "rapid" ? "RAPID_API_KEY" : QUOTE_PROVIDER === "kiwi" ? "KIWI_API_KEY" : "OMKAR_API_KEY";
+  QUOTE_PROVIDER === "rapid" ? "RAPID_API_KEY"
+  : QUOTE_PROVIDER === "kiwi" ? "KIWI_API_KEY"
+  : QUOTE_PROVIDER === "duffel" ? "DUFFEL_API_KEY"
+  : "OMKAR_API_KEY";
 if (!ACTIVE.apiKey) {
   console.error(`[quote-server] WARNING: ${ACTIVE_KEY_ENV} is empty; quotes will 503.`);
 }
@@ -297,6 +308,94 @@ async function upstreamErrorDetail(res) {
   } catch {
     return null;
   }
+}
+
+// Duffel offer_requests as a quote source. Reuses the same DUFFEL_API_KEY
+// that booking-provider/ uses for real order creation, so a working quote
+// here is also proof the booking path's credential is healthy. Real live
+// fares (or Duffel Airways' sandbox fares in test mode) — not a scrape, no
+// separate account to keep alive.
+async function fetchDuffelFare({ origin, destination, depart }) {
+  if (!DUFFEL_QUOTE_KEY) {
+    throw new ApiError(503, "DUFFEL_API_KEY not configured. Add it to server/.env, then restart.");
+  }
+  let res = null;
+  let networkErr = null;
+  for (let attempt = 0; attempt < UPSTREAM_ATTEMPTS; attempt++) {
+    try {
+      res = await fetch("https://api.duffel.com/air/offer_requests", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${DUFFEL_QUOTE_KEY}`,
+          "Duffel-Version": "v2",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          data: {
+            slices: [{ origin, destination, departure_date: depart }],
+            passengers: [{ type: "adult" }],
+            cabin_class: "economy",
+          },
+        }),
+        signal: AbortSignal.timeout(20_000),
+      });
+      networkErr = null;
+    } catch (err) {
+      res = null;
+      networkErr = err.message;
+    }
+
+    if (res) {
+      if (res.status === 401 || res.status === 403) {
+        throw new ApiError(502, "Duffel rejected the key (401/403). Check DUFFEL_API_KEY.");
+      }
+      if (res.ok) break;
+      if (res.status < 500 && res.status !== 429) {
+        const detail = await upstreamErrorDetail(res);
+        throw new ApiError(
+          502,
+          `Duffel offer_requests failed (${res.status}${detail ? `: ${detail}` : ""}). ` +
+            "Try a different route or dates."
+        );
+      }
+      // else 5xx or 429: transient — fall through to retry/backoff below.
+    }
+
+    if (attempt < UPSTREAM_ATTEMPTS - 1) {
+      await sleep(UPSTREAM_RETRY_DELAY_MS[attempt] ?? 750);
+      continue;
+    }
+
+    if (networkErr) {
+      throw new TransientError(502, `Duffel unreachable after ${UPSTREAM_ATTEMPTS} attempts: ${networkErr}`);
+    }
+    const detail = res ? await upstreamErrorDetail(res) : null;
+    const status = res?.status === 429 ? 429 : 502;
+    throw new TransientError(
+      status,
+      `Duffel temporarily unavailable after ${UPSTREAM_ATTEMPTS} attempts (${res?.status ?? "network"}${detail ? `: ${detail}` : ""}). Try again in a moment.`
+    );
+  }
+
+  const j = await res.json();
+  const offers = j?.data?.offers ?? j?.data?.offer_requests?.[0]?.offers ?? [];
+  if (!offers.length) {
+    throw new ApiError(502, "Duffel returned no offers for this route/date.");
+  }
+  let best = null;
+  for (const o of offers) {
+    const price = parseUsdPrice(o.total_amount) ?? Number(o.total_amount);
+    if (!Number.isFinite(price) || price <= 0) continue;
+    if (!best || price < best.price) best = { price, o };
+  }
+  if (!best) throw new ApiError(502, "Duffel offers had no usable price.");
+  const seg = best.o.slices?.[0]?.segments?.[0];
+  const carrier = seg?.operating_carrier?.name ?? seg?.marketing_carrier?.name ?? "";
+  return {
+    usdTotal: best.price,
+    usdCurrency: String(best.o.total_currency || "USD").toUpperCase(),
+    carrier,
+  };
 }
 
 async function fetchExpediaQuote({ origin, destination, depart }) {
@@ -544,6 +643,10 @@ async function fetchFare({ origin, destination, depart }) {
   if (QUOTE_PROVIDER === "kiwi") {
     const fare = await fetchKiwiFare({ origin, destination, depart });
     return { ...fare, provider: "kiwi" };
+  }
+  if (QUOTE_PROVIDER === "duffel") {
+    const fare = await fetchDuffelFare({ origin, destination, depart });
+    return { ...fare, provider: "duffel" };
   }
   const fare = await fetchExpediaQuote({ origin, destination, depart });
   return { ...fare, provider: "omkarcloud" };
