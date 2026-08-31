@@ -57,17 +57,10 @@ in `server/.env`:
 - `omkarcloud` — OmkarCloud Expedia scraper (`free tier: 100 requests/month` at
   `omkar.cloud` → `OMKAR_API_KEY`).
 
-While the chosen provider is down, the server returns a clear 503 (or a stale,
-clearly-marked cached quote) — it never fabricates a price or silently switches
-sources.
+Quotes are live via `QUOTE_PROVIDER=rapid` (`render.yaml:31`) — `GET /api/quote?from=&to=&depart=&ret=` proxied through `travity-server` and agreed on-chain via `refresh_quote` `prompt_comparative` (5% tolerance).
 
-1. Copy `server/.env.example` to `server/.env`; set `QUOTE_PROVIDER`, the
-   matching provider key, plus `GEN_USD_RATE` (the server also probes
-   CoinGecko first — currently GEN has no listing, so the env rate is the
-   reliable source).
-2. Restart the server. `GET /api/quote?from=JFK&to=LHR&depart=YYYYMMDD&ret=…`
-   returns the cheapest real outbound fare converted to GEN wei. With no
-   provider configured the server returns 503 — it never fabricates a price.
+1. Copy `server/.env.example` to `server/.env`; set `RAPID_API_KEY` and `GEN_USD_RATE` (the server also probes CoinGecko first — currently GEN has no listing, so the env rate is the reliable source).
+2. Restart the server. `GET /api/quote?from=JFK&to=LHR&depart=YYYYMMDD&ret=…` returns the cheapest real outbound fare converted to GEN wei — no fabricated price, live RapidAPI success path.
 
 ### 2. Live on-chain + wallet — GenLayer Studio
 
