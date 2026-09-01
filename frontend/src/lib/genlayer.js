@@ -138,11 +138,11 @@ const isValidDates = (depart, ret) =>
 const isValidRef = (ref) =>
   typeof ref === "string" && /^[A-Z0-9]{4,12}$/.test(ref.trim());
 
-/** Issues a real reservation (PNR) at the quote server, returning the ref
- * the contract will store in `book()`. The ref is the anchor that
- * dispute escalation verifies against authenticated `/status` evidence —
- * it cannot be made up, it must come from the agency. */
-async function createReservation({ origin, destination, depart, ret }) {
+/** Issues a real reservation (PNR) at the quote server, returning the bound
+ * tuple the contract seals in `book()`: ref + Duffel offer/order/passenger +
+ * itinerary JSON. The ref is the anchor dispute escalation and settlement
+ * verify against authenticated `/provider-status` evidence. */
+async function createReservation({ origin, destination, depart, ret, passenger, itineraryJson }) {
   const base = (import.meta.env.VITE_QUOTE_API || "").replace(/\/+$/, "");
   const res = await fetch(`${base}/api/reserve`, {
     method: "POST",
@@ -152,11 +152,19 @@ async function createReservation({ origin, destination, depart, ret }) {
       to: String(destination).toUpperCase(),
       depart: String(depart),
       ret: String(ret),
+      passenger: passenger ?? null,
+      itinerary_json: itineraryJson ?? null,
     }),
   });
   const j = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(j.error || `Reservation failed (${res.status})`);
-  return String(j.ref || "").toUpperCase();
+  return {
+    ref: String(j.ref || "").toUpperCase(),
+    offerId: String(j.offerId || j.offer_id || ""),
+    duffelOrderId: String(j.duffelOrderId || j.duffel_order_id || ""),
+    passengerId: String(j.passengerId || j.passenger_id || ""),
+    itineraryJson: String(j.itinerary_json || j.itineraryJson || itineraryJson || ""),
+  };
 }
 
 // ---- live helpers (genlayer-js) ---------------------------------------------
@@ -278,20 +286,23 @@ export class TravityClient {
     };
   }
 
-  async book({ origin, destination, depart, ret, paymentWei, reservationRef, account, provider }) {
+  async book({ origin, destination, depart, ret, paymentWei, reservationRef, duffelOfferId, duffelOrderId, passengerId, itineraryJson, account, provider }) {
     const o = origin.toUpperCase(), d = destination.toUpperCase();
     const dep = Number(depart), r = Number(ret);
     if (!isValidRoute(o, d)) throw new Error("Invalid route.");
     if (!isValidDates(dep, r)) throw new Error("Return date must be after departure date.");
     const priceWei = BigInt(paymentWei ?? 0n);
     if (priceWei <= 0n) throw new Error("Payment must be greater than zero.");
-    // The contract rejects book() without a real, agency-issued reservation
-    // ref (server /api/reserve). A made-up/client-generated ref is never
-    // accepted as evidence later, so require one here.
     const ref = isValidRef(reservationRef) ? reservationRef.trim().toUpperCase() : "";
-    if (!ref) {
-      throw new Error("A reservation reference is required. Reserve your seat on the agency first.");
-    }
+    if (!ref) throw new Error("A reservation reference is required. Reserve your seat on the agency first.");
+    const offerId = String(duffelOfferId || "").trim();
+    const orderId = String(duffelOrderId || "").trim();
+    const pasId = String(passengerId || "").trim();
+    const itin = String(itineraryJson || "").trim();
+    if (!offerId.startsWith("off_")) throw new Error("Offer id missing — create a reservation first.");
+    if (!orderId.startsWith("ord_")) throw new Error("Order id missing — create a reservation first.");
+    if (!pasId.startsWith("pas_")) throw new Error("Passenger id missing — create a reservation first.");
+    if (!itin || itin.length < 10) throw new Error("Itinerary missing — create a reservation first.");
 
     // Cached on-chain agreement for these exact dates. When present we skip the
     // refresh_quote write entirely: repeat bookings drop to a single write per
@@ -333,7 +344,7 @@ export class TravityClient {
     const client = await this.writeClient(account, provider);
     await runWrite(client, {
       functionName: "book",
-      args: [o, d, dep, r, ref],
+      args: [o, d, dep, r, ref, offerId, orderId, pasId, itin],
       value: bookValue,
     });
     // The contract stores bookings under `_quote_key + "-" + str(sender)`
@@ -396,12 +407,11 @@ export class TravityClient {
     return clean;
   }
 
-  /** Issues a real reservation (PNR) at the quote server. The returned ref is
-   * required by book() and is later verified against authenticated /status
-   * evidence by dispute escalation. This is the "tied to a real
-   * reservation" anchor — a made-up ref is never accepted as evidence. */
-  async createReservation({ origin, destination, depart, ret }) {
-    return createReservation({ origin, destination, depart, ret });
+  /** Issues a real reservation (PNR) at the quote server. The returned bound
+   * tuple is required by book() and is later verified against authenticated
+   * /provider-status evidence by both settlement and dispute. */
+  async createReservation({ origin, destination, depart, ret, passenger, itineraryJson }) {
+    return createReservation({ origin, destination, depart, ret, passenger, itineraryJson });
   }
 
   /** Owner-only (set_provider). The carrier/agency settlement payout

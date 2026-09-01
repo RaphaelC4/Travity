@@ -178,7 +178,7 @@ function yyyymmddToIso(s) {
 // BOOKING_PROVIDER_URL at). Keeps the same trust property — the PNR comes
 // from an external transaction — without locking to one vendor's developer program.
 
-async function createBookingViaProvider(from, to, departIso, retIso) {
+async function createBookingViaProvider(from, to, departIso, retIso, passenger, itineraryJson) {
   const url = String(process.env.BOOKING_PROVIDER_URL || "").trim();
   if (!url) return null;
   const apiKey = String(process.env.BOOKING_PROVIDER_API_KEY || "").trim();
@@ -189,7 +189,7 @@ async function createBookingViaProvider(from, to, departIso, retIso) {
         "Content-Type": "application/json",
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
       },
-      body: JSON.stringify({ from, to, depart: departIso, ret: retIso }),
+      body: JSON.stringify({ from, to, depart: departIso, ret: retIso, passenger, itinerary_json: itineraryJson }),
     });
     if (!res.ok) return null;
     const j = await res.json().catch(() => ({}));
@@ -200,8 +200,11 @@ async function createBookingViaProvider(from, to, departIso, retIso) {
       locator,
       flightIata,
       flightDate: departIso,
-      providerOrderId: j.duffelOrderId ?? null,
+      providerOrderId: j.duffelOrderId ?? j.orderId ?? null,
       refundPolicy: j.refundPolicy ?? null,
+      offerId: j.offerId ?? null,
+      passengerId: j.passengerId ?? j.passenger_id ?? null,
+      itineraryJson: j.itinerary_json ?? j.itineraryJson ?? itineraryJson ?? null,
     };
   } catch {
     return null;
@@ -880,6 +883,8 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
   const to = String(req.body?.to || "").trim().toUpperCase();
   const depart = String(req.body?.depart || "").trim();
   const ret = String(req.body?.ret || "").trim();
+  const passenger = req.body?.passenger ?? null;
+  const itineraryJson = req.body?.itinerary_json ?? req.body?.itineraryJson ?? null;
   try {
     const { from: f, to: t, depart: d, ret: r } = parseRoute({ query: { from, to, depart, ret } });
     if (!BOOKING_PROVIDER_URL) {
@@ -888,7 +893,7 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
     let pnr;
     let bindingFlights = null;
     try {
-      const real = await createBookingViaProvider(f, t, d, r);
+      const real = await createBookingViaProvider(f, t, d, r, passenger, itineraryJson);
       if (!real) {
         return res.status(502).json({ error: "booking provider failed to issue a reference" });
       }
@@ -896,6 +901,9 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
       bindingFlights = [{ flightIata: real.flightIata, flightDate: real.flightDate }];
       var providerOrderId = real.providerOrderId ?? null;
       var refundPolicy = real.refundPolicy ?? null;
+      var offerId = real.offerId ?? null;
+      var passengerId = real.passengerId ?? null;
+      var boundItineraryJson = real.itineraryJson ?? itineraryJson ?? null;
     } catch (e) {
       return res.status(502).json({ error: `booking provider error: ${e.message}` });
     }
@@ -909,6 +917,9 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
       flights: bindingFlights ?? [],
       providerOrderId: providerOrderId ?? null,
       refundPolicy: refundPolicy ?? null,
+      offerId: offerId ?? null,
+      passenger_id: passengerId ?? null,
+      itinerary_json: boundItineraryJson ?? null,
       status: "confirmed",
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -923,10 +934,13 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
     }
     if (!record.providerOrderId && providerOrderId) record.providerOrderId = providerOrderId;
     if (!record.refundPolicy && refundPolicy) record.refundPolicy = refundPolicy;
+    if (!record.offerId && offerId) record.offerId = offerId;
+    if (!record.passenger_id && passengerId) record.passenger_id = passengerId;
+    if (!record.itinerary_json && boundItineraryJson) record.itinerary_json = boundItineraryJson;
     cache.reservations.set(pnr, record);
     saveReservations();
     const status = effectiveStatus(record.status, r);
-    return res.status(existing ? 200 : 201).json({ ref: pnr, route: `${f}-${t}`, status, provider: record.provider });
+    return res.status(existing ? 200 : 201).json({ ref: pnr, route: `${f}-${t}`, status, provider: record.provider, duffelOrderId: record.providerOrderId, offerId: record.offerId, passengerId: record.passenger_id, itinerary_json: record.itinerary_json });
   } catch (err) {
     const status = err instanceof ApiError ? err.status : 400;
     return res.status(status).json({ error: err.message || "invalid reservation request" });
@@ -998,6 +1012,10 @@ app.get("/provider-status", async (req, res) => {
     ref,
     route: binding.route,
     status: derived,
+    duffel_order_id: binding.providerOrderId ?? null,
+    passenger_id: binding.passenger_id ?? null,
+    itinerary_json: binding.itinerary_json ?? null,
+    offerId: binding.offerId ?? null,
     refund_policy: refundPolicy,
     aviation,
     source,

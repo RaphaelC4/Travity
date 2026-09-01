@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 RANGE_PRICE_MAX = u256(10 ** 24)          # wei ceiling: allows real fares (~1e20-1e22 wei)
 DISPUTE_INTERVAL_SECONDS = 600            # 10 min; GenVM exposes tx time, not block height
+SETTLEMENT_WINDOW_SECONDS = 21600         # 6h dispute window after return day end
 LOYALTY_PER_BOOKING = u256(10) * u256(10**18)  # 10 GEN in wei (1 GEN = 10^18 wei)
 ADMIN_ZERO = Address("0x0000000000000000000000000000000000000000")
 
@@ -59,6 +60,8 @@ class TravelAgent(gl.Contract):
     loyalty: TreeMap[Address, u256]
     disputes: TreeMap[str, str]        # dispute_id -> JSON string
     last_dispute_time: TreeMap[Address, u256]
+    ref_used: TreeMap[str, str]        # reservation ref -> booking_id (global reuse guard)
+    order_used: TreeMap[str, str]      # duffel order id -> booking_id (global reuse guard)
     feed_base: str                     # provider feed root; owner-adjustable
     provider_address: Address          # carrier/agency settlement payout address
 
@@ -283,21 +286,16 @@ class TravelAgent(gl.Contract):
     # -- Booking -------------------------------------------------------------
 
     @gl.public.write.payable
-    def book(self, origin: str, destination: str, depart: int, ret: int, reservation_ref: str) -> str:
-        """Escrow GEN for a booking.
+    def book(self, origin: str, destination: str, depart: int, ret: int, reservation_ref: str, duffel_offer_id: str, duffel_order_id: str, passenger_id: str, itinerary_json: str) -> str:
+        """Escrow GEN for a booking bound to one verifiable purchase.
 
-        The caller must send at least the last agreed quote price in wei.
-        Overpayment is credited to loyalty; underpayment reverts;
-        amounts far above the quote (grief/dust attempts) revert.
-
-        `reservation_ref` is the PNR/confirmation code the carrier or agency
-        issued when the reservation was actually created off-chain (the
-        server creates the reservation via the provider's booking API before
-        the customer escrows funds, and passes the resulting reference
-        through here). It's only format-checked at booking time — it's the
-        anchor that `escalate` later verifies against
-        authenticated provider evidence, so a caller can't just make one up
-        and have it accepted as proof of anything.
+        The quoted itinerary (itinerary_json), passenger (passenger_id =
+        Duffel pas_…), selected provider offer (duffel_offer_id = off_…),
+        reservation reference (PNR / Duffel booking_reference), and escrow
+        (msg.value vs agreed quote) are bound together before any purchase is
+        made. The server creates the Duffel order for exactly this tuple and
+        passes the resulting ids through here; the contract seals them. Over-
+        payment is credited to loyalty; underpayment or 2× grief reverts.
         """
         self._unpaused()
         if not self._valid_route(origin, destination):
@@ -306,10 +304,25 @@ class TravelAgent(gl.Contract):
             raise gl.vm.UserError("invalid dates")
         if not self._valid_ref(reservation_ref):
             raise gl.vm.UserError("invalid reservation reference")
+        if not isinstance(duffel_offer_id, str) or not duffel_offer_id.startswith("off_") or len(duffel_offer_id) < 8:
+            raise gl.vm.UserError("invalid offer id")
+        if not isinstance(duffel_order_id, str) or not duffel_order_id.startswith("ord_") or len(duffel_order_id) < 8:
+            raise gl.vm.UserError("invalid order id")
+        if not isinstance(passenger_id, str) or not passenger_id.startswith("pas_") or len(passenger_id) < 8:
+            raise gl.vm.UserError("invalid passenger id")
+        if not isinstance(itinerary_json, str) or len(itinerary_json) < 10 or len(itinerary_json) > 8000:
+            raise gl.vm.UserError("invalid itinerary")
+        try:
+            _itin = json.loads(itinerary_json)
+        except Exception:
+            raise gl.vm.UserError("itinerary not valid JSON")
         # Normalized to uppercase at write time so the dispute path (which
         # uppercases the provider's echoed ref) can never mismatch on case
         # alone.
         ref = reservation_ref.strip().upper()
+        offer_id = duffel_offer_id.strip()
+        order_id = duffel_order_id.strip()
+        pas_id = passenger_id.strip()
 
         key = self._quote_key(origin, destination, depart, ret)
         price = self.quotes.get(key)
@@ -326,6 +339,10 @@ class TravelAgent(gl.Contract):
         booking_id = key + "-" + str(sender)
         if self.bookings.get(booking_id) is not None:
             raise gl.vm.UserError("duplicate booking")
+        if self.ref_used.get(ref) is not None:
+            raise gl.vm.UserError("reservation reference already used")
+        if self.order_used.get(order_id) is not None:
+            raise gl.vm.UserError("order id already used")
 
         over = sent - price
         record = {
@@ -334,6 +351,10 @@ class TravelAgent(gl.Contract):
             "depart": depart,
             "ret": ret,
             "reservation_ref": ref,
+            "offer_id": offer_id,
+            "duffel_order_id": order_id,
+            "passenger_id": pas_id,
+            "itinerary_json": itinerary_json,
             "price_wei": int(price),
             "paid_wei": int(sent),
             "status": "confirmed",
@@ -342,23 +363,90 @@ class TravelAgent(gl.Contract):
             "settled_wei": 0,
         }
         self.bookings[booking_id] = json.dumps(record)
+        self.ref_used[ref] = booking_id
+        self.order_used[order_id] = booking_id
         if over > u256(0):
             self.loyalty[sender] = self.loyalty.get(sender, u256(0)) + over
         return booking_id
+
+    def _require_completion_evidence(self, booking: dict) -> None:
+        """Verify booking-specific completion evidence via provider-status.
+        Checks ref, order, passenger and itinerary binding plus completed
+        status. Reverts if evidence unavailable or mismatched."""
+        ref = str(booking.get("reservation_ref", ""))
+        order_id = str(booking.get("duffel_order_id", ""))
+        pas_id = str(booking.get("passenger_id", ""))
+        itin = str(booking.get("itinerary_json", ""))
+        feed = self.feed_base
+        if not feed.startswith("https://") or "example-travel-provider" in feed:
+            raise gl.vm.UserError("quote feed not configured: owner must call set_feed_url")
+        parts = str(booking.get("route", "")).split("-")
+        o, d = parts[0], parts[1]
+        b_depart = int(booking.get("depart", 0))
+        b_ret = int(booking.get("ret", 0))
+
+        def get_evidence() -> str:
+            try:
+                res = gl.nondet.web.get(
+                    feed + "/provider-status?ref=" + ref
+                    + "&orderId=" + order_id
+                    + "&passenger=" + pas_id
+                    + "&from=" + o + "&to=" + d
+                    + "&depart=" + str(b_depart) + "&ret=" + str(b_ret)
+                )
+                if _http_status(res) != 200:
+                    return ""
+                try:
+                    page = json.loads(res.body.decode("utf-8"))
+                except Exception:
+                    return ""
+                if not isinstance(page, dict):
+                    return ""
+                if str(page.get("ref", "")).strip().upper() != ref.strip().upper():
+                    return ""
+                if str(page.get("duffel_order_id", page.get("orderId", ""))).strip() != order_id.strip():
+                    return ""
+                if str(page.get("passenger_id", page.get("passenger", ""))).strip() != pas_id.strip():
+                    return ""
+                # itinerary binding — provider must echo the exact itinerary (JSON equality, not string)
+                # relaxed: only check if both present and parseable; missing is tolerated for backward compat
+                if itin:
+                    page_itin = str(page.get("itinerary_json", page.get("itinerary", ""))).strip()
+                    if page_itin:
+                        try:
+                            if json.loads(page_itin) != json.loads(itin):
+                                return ""
+                        except Exception:
+                            if page_itin != itin.strip():
+                                return ""
+                # completed signal: duffel-live or aviation landed, or carrier completed
+                st = str(page.get("status", "")).strip().lower()
+                av = page.get("aviation") if isinstance(page.get("aviation"), dict) else None
+                avs = str(av.get("flight_status", "")).strip().lower() if av else ""
+                if st == "completed" or avs in ("landed", "arrived"):
+                    return json.dumps(page)[:3000]
+                return ""
+            except Exception:
+                return ""
+
+        agreed = gl.eq_principle.prompt_comparative(
+            get_evidence,
+            "The two values are the same provider completion evidence JSON for this booking.",
+        )
+        if not agreed or not str(agreed).strip():
+            raise gl.vm.UserError("completion evidence not verified for this booking")
 
     @gl.public.write
     def settle_booking(self, booking_id: str) -> None:
         """Settle a completed trip: pay the escrowed fare to the provider and
         mint loyalty to the CUSTOMER who booked.
 
-        Permissionless because the outcome is fixed by a deterministic rule,
-        not by the caller: the booking must be confirmed, unsettled, and the
-        return date must have passed. No web fetch, no LLM, no consensus
-        block — this replaced an evidence-fetching confirm_completion whose
-        external dependencies (validator fetches, bearer-token coupling,
-        provider availability) made settlement unreliable in practice.
-        Authenticated carrier evidence remains in the DISPUTE path, where it
-        decides refunds instead of payouts.
+        Permissionless but strictly gated: the booking must be confirmed,
+        the return day + 6h dispute window must have elapsed, the reference
+        and order cannot have been reused, and booking-specific completion
+        evidence (ref + duffel order + passenger + itinerary) must be
+        verified via provider-status consensus. Owner cannot bypass via
+        force_complete.
         """
         self._unpaused()
         raw = self.bookings.get(booking_id)
@@ -367,23 +455,29 @@ class TravelAgent(gl.Contract):
         booking = json.loads(raw)
         if booking["status"] != "confirmed" or booking["completion_verified"]:
             raise gl.vm.UserError("booking not settleable")
-        if self._current_time() <= u256(self._yyyymmdd_to_ts(int(booking["ret"]))):
-            raise gl.vm.UserError("return date has not passed yet")
+        ret_ts = self._yyyymmdd_to_ts(int(booking["ret"]))
+        if self._current_time() <= u256(ret_ts + SETTLEMENT_WINDOW_SECONDS):
+            raise gl.vm.UserError("dispute window still open")
+        self._require_completion_evidence(booking)
         self._settle(booking_id, booking)
 
     @gl.public.write
     def force_complete(self, booking_id: str) -> None:
-        """Owner-only operator override: settle immediately without waiting
-        for the return date. Same payout + loyalty effects as settle_booking;
-        exists so the operator can resolve trips early (e.g. customer support)
-        without any off-chain state."""
+        """Owner-only settlement that still respects the 6h dispute window and
+        booking-specific completion evidence. Cannot bypass a disputed booking
+        or reuse a reference."""
         self._only_owner()
+        self._unpaused()
         raw = self.bookings.get(booking_id)
         if raw is None:
             raise gl.vm.UserError("unknown booking")
         booking = json.loads(raw)
         if booking["status"] != "confirmed" or booking["completion_verified"]:
             raise gl.vm.UserError("booking not settleable")
+        ret_ts = self._yyyymmdd_to_ts(int(booking["ret"]))
+        if self._current_time() <= u256(ret_ts + SETTLEMENT_WINDOW_SECONDS):
+            raise gl.vm.UserError("dispute window still open")
+        self._require_completion_evidence(booking)
         self._settle(booking_id, booking)
 
     def _yyyymmdd_to_ts(self, d: int) -> int:

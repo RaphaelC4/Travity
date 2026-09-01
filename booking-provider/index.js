@@ -56,6 +56,8 @@ app.post("/book", limiter, async (req, res) => {
   const to = String(req.body?.to ?? req.body?.destination ?? "").trim().toUpperCase();
   const departRaw = String(req.body?.depart ?? "").trim();
   const retRaw = String(req.body?.ret ?? "").trim();
+  const reqPassenger = req.body?.passenger ?? null;
+  const reqItineraryJson = String(req.body?.itinerary_json ?? req.body?.itineraryJson ?? "").trim() || null;
   if (!IATA_RE.test(from) || !IATA_RE.test(to) || from === to) {
     return res.status(400).json({ error: "from/to must be distinct 3-letter IATA codes" });
   }
@@ -94,6 +96,19 @@ app.post("/book", limiter, async (req, res) => {
         throw new Error("Duffel offer missing total_amount/total_currency");
       }
 
+      // Use caller-supplied passenger if present, else dummy John Doe (dev)
+      const pasIn = reqPassenger && typeof reqPassenger === "object" ? reqPassenger : {};
+      const passengerForOrder = {
+        id: offer.passengers?.[0]?.id ?? String(pasIn.id ?? "pas_00000000000000"),
+        given_name: String(pasIn.given_name ?? "John"),
+        family_name: String(pasIn.family_name ?? "Doe"),
+        born_on: String(pasIn.born_on ?? "1990-01-01"),
+        gender: String(pasIn.gender ?? "m"),
+        title: String(pasIn.title ?? "mr"),
+        email: String(pasIn.email ?? "john.doe@example.com"),
+        phone_number: String(pasIn.phone_number ?? "+14155551234"),
+      };
+      const itineraryJsonBound = reqItineraryJson ?? JSON.stringify({ slices: offer.slices, passengers: offer.passengers, cabin_class: "economy" });
       const orderRes = await fetch("https://api.duffel.com/air/orders", {
         method: "POST",
         headers: {
@@ -105,7 +120,7 @@ app.post("/book", limiter, async (req, res) => {
           data: {
             type: "instant",
             selected_offers: [offer.id],
-            passengers: [{ id: offer.passengers?.[0]?.id ?? "pas_00000000000000", given_name: "John", family_name: "Doe", born_on: "1990-01-01", gender: "m", title: "mr", email: "john.doe@example.com", phone_number: "+14155551234" }],
+            passengers: [passengerForOrder],
             // Duffel requires payment on order creation itself, not a
             // separate call — pays from your Duffel balance (auto-funded
             // in test mode; must be topped up for live mode). Amount/
@@ -132,6 +147,9 @@ app.post("/book", limiter, async (req, res) => {
         status: "confirmed",
         provider: "duffel",
         duffelOrderId: orderJson.data?.id ?? null,
+        offerId: offer.id,
+        passengerId: passengerForOrder.id,
+        itinerary_json: itineraryJsonBound,
         refundPolicy: refundPolicyFrom(orderJson.data?.conditions),
       });
     } catch (e) {
@@ -152,6 +170,9 @@ app.post("/book", limiter, async (req, res) => {
   }
   const locator = pnrFor(from, to, departIso, retIso);
   const flightIata = `${from}${String(Math.abs(parseInt(crypto.createHash("sha256").update(locator).digest("hex").slice(0, 3), 16) % 900) + 100)}`.slice(0, 6);
+  const dummyPas = String(reqPassenger?.id ?? "pas_00000000000000");
+  const dummyOffer = "off_00000000000000";
+  const dummyItin = reqItineraryJson ?? JSON.stringify({ from, to, departIso, retIso, cabin: "economy" });
   return res.json({
     locator,
     flightIata,
@@ -159,6 +180,10 @@ app.post("/book", limiter, async (req, res) => {
     route: `${from}-${to}`,
     status: "confirmed",
     provider: "hmac-dev-fixture",
+    duffelOrderId: `ord_${locator}`,
+    offerId: dummyOffer,
+    passengerId: dummyPas,
+    itinerary_json: dummyItin,
     refundPolicy: { refundable: "unknown", penalty: null },
   });
 });
