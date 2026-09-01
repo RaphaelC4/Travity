@@ -68,15 +68,39 @@ def test_settle_requires_completion_evidence(direct_vm, agent, direct_alice, dir
         agent.settle_booking(bid1)
     # mismatched passenger -> revert
     bid2 = _book(direct_vm, agent, direct_bob, ref="PNRBADP2", order="ord_badp2_12345678")
-    bad = json.dumps({"ref": "PNRBADP2", "duffel_order_id": "ord_badp2_12345678", "passenger_id": "pas_WRONG", "itinerary_json": ITIN_JSON, "route": "JFK-LHR", "status": "completed"})
+    bad = json.dumps({"ref": "PNRBADP2", "duffel_order_id": "ord_badp2_12345678", "passenger_id": "pas_WRONG", "itinerary_json": ITIN_JSON, "offerId": OFFER_ID, "route": "JFK-LHR", "status": "completed"})
     direct_vm.mock_web(rf"{FEED}/provider-status\?ref=PNRBADP2.*", {"status": 200, "body": bad})
     direct_vm.mock_llm(r".*", bad)
     with pytest.raises(Exception, match="completion evidence"):
         agent.settle_booking(bid2)
-    # correct evidence -> succeeds
-    bid3 = _book(direct_vm, agent, direct_owner, ref="PNRABC123", order=ORDER_ID)
+    # mismatched order -> revert
+    bid2b = _book(direct_vm, agent, direct_owner, ref="PNRBADO3", order="ord_bado3_12345678")
+    bad_ord = json.dumps({"ref": "PNRBADO3", "duffel_order_id": "ord_WRONG", "passenger_id": PAS_ID, "itinerary_json": ITIN_JSON, "offerId": OFFER_ID, "route": "JFK-LHR", "status": "completed"})
+    direct_vm.mock_web(rf"{FEED}/provider-status\?ref=PNRBADO3.*", {"status": 200, "body": bad_ord})
+    direct_vm.mock_llm(r".*", bad_ord)
+    with pytest.raises(Exception, match="completion evidence"):
+        agent.settle_booking(bid2b)
+    # mismatched itinerary -> revert
+    with direct_vm.prank("0x4444444444444444444444444444444444444444"):
+        direct_vm.value = PRICE
+        # need quote for past dates already exists; reuse
+        bid2c2 = agent.book("JFK", "LHR", PAST_DEPART, PAST_RET, "PNRBADI4b", OFFER_ID, "ord_badi4b_12345678", PAS_ID, ITIN_JSON)
+    direct_vm.value = 0
+    bad_itin = json.dumps({"ref": "PNRBADI4b", "duffel_order_id": "ord_badi4b_12345678", "passenger_id": PAS_ID, "itinerary_json": json.dumps({"wrong": True}), "offerId": OFFER_ID, "route": "JFK-LHR", "status": "completed"})
+    direct_vm.mock_web(rf"{FEED}/provider-status\?ref=PNRBADI4b.*", {"status": 200, "body": bad_itin})
+    direct_vm.mock_llm(r".*", bad_itin)
+    with pytest.raises(Exception, match="completion evidence"):
+        agent.settle_booking(bid2c2)
+    # correct evidence -> succeeds (fresh sender to avoid duplicate booking_id)
+    with direct_vm.prank("0x5555555555555555555555555555555555555555"):
+        direct_vm.value = PRICE
+        # need quote again for this sender's booking? _book already does quote
+        _quote(direct_vm, agent)
+        bid3 = agent.book("JFK", "LHR", PAST_DEPART, PAST_RET, "PNRABC123", OFFER_ID, ORDER_ID, PAS_ID, ITIN_JSON)
+    direct_vm.value = 0
     direct_vm.mock_web(rf"{FEED}/provider-status\?ref=PNRABC123.*", {"status": 200, "body": _completion_body("completed")})
     direct_vm.mock_llm(r".*", _completion_body("completed"))
+    # prank not needed for settle (permissionless), but use any sender
     agent.settle_booking(bid3)
     raw = agent.view_booking(bid3)
     rec = json.loads(raw) if isinstance(raw, str) else raw

@@ -377,6 +377,7 @@ class TravelAgent(gl.Contract):
         order_id = str(booking.get("duffel_order_id", ""))
         pas_id = str(booking.get("passenger_id", ""))
         itin = str(booking.get("itinerary_json", ""))
+        offer_id = str(booking.get("offer_id", ""))
         feed = self.feed_base
         if not feed.startswith("https://") or "example-travel-provider" in feed:
             raise gl.vm.UserError("quote feed not configured: owner must call set_feed_url")
@@ -408,17 +409,19 @@ class TravelAgent(gl.Contract):
                     return ""
                 if str(page.get("passenger_id", page.get("passenger", ""))).strip() != pas_id.strip():
                     return ""
-                # itinerary binding — provider must echo the exact itinerary (JSON equality, not string)
-                # relaxed: only check if both present and parseable; missing is tolerated for backward compat
+                if offer_id and str(page.get("offerId", page.get("offer_id", ""))).strip() != offer_id.strip():
+                    return ""
+                # itinerary binding — provider must echo the exact itinerary when bound
                 if itin:
                     page_itin = str(page.get("itinerary_json", page.get("itinerary", ""))).strip()
-                    if page_itin:
-                        try:
-                            if json.loads(page_itin) != json.loads(itin):
-                                return ""
-                        except Exception:
-                            if page_itin != itin.strip():
-                                return ""
+                    if not page_itin:
+                        return ""
+                    try:
+                        if json.loads(page_itin) != json.loads(itin):
+                            return ""
+                    except Exception:
+                        if page_itin != itin.strip():
+                            return ""
                 # completed signal: duffel-live or aviation landed, or carrier completed
                 st = str(page.get("status", "")).strip().lower()
                 av = page.get("aviation") if isinstance(page.get("aviation"), dict) else None
