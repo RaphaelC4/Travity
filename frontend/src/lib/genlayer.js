@@ -299,10 +299,15 @@ export class TravityClient {
     const orderId = String(duffelOrderId || "").trim();
     const pasId = String(passengerId || "").trim();
     const itin = String(itineraryJson || "").trim();
-    if (!offerId.startsWith("off_")) throw new Error("Offer id missing — create a reservation first.");
-    if (!orderId.startsWith("ord_")) throw new Error("Order id missing — create a reservation first.");
-    if (!pasId.startsWith("pas_")) throw new Error("Passenger id missing — create a reservation first.");
-    if (!itin || itin.length < 10) throw new Error("Itinerary missing — create a reservation first.");
+    const isLegacy = String(contractAddress || "").toLowerCase() === "0x774efd6bb076fcb270e1bb596d8c0335e5895d27";
+    if (!isLegacy) {
+      if (!offerId.startsWith("off_")) throw new Error("Offer id missing — create a reservation first. Is the booking-provider (DUFFEL_API_KEY) configured?");
+      if (!orderId.startsWith("ord_")) throw new Error("Order id missing — create a reservation first.");
+      if (!pasId.startsWith("pas_")) throw new Error("Passenger id missing — create a reservation first.");
+      if (!itin || itin.length < 10) throw new Error("Itinerary missing — create a reservation first.");
+    } else if (offerId && !offerId.startsWith("off_")) {
+      throw new Error("Offer id malformed.");
+    }
 
     // Cached on-chain agreement for these exact dates. When present we skip the
     // refresh_quote write entirely: repeat bookings drop to a single write per
@@ -342,11 +347,25 @@ export class TravityClient {
 
     const bookValue = agreed > 0n ? agreed : priceWei;
     const client = await this.writeClient(account, provider);
-    await runWrite(client, {
-      functionName: "book",
-      args: [o, d, dep, r, ref, offerId, orderId, pasId, itin],
-      value: bookValue,
-    });
+    try {
+      await runWrite(client, {
+        functionName: "book",
+        args: [o, d, dep, r, ref, offerId, orderId, pasId, itin],
+        value: bookValue,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Old 5-arg deployment (0x774e…5D27) rejects 9 args with arity error — retry legacy
+      if (/too many arguments|unexpected arguments|wrong.*arg|invalid number of/i.test(msg)) {
+        await runWrite(client, {
+          functionName: "book",
+          args: [o, d, dep, r, ref],
+          value: bookValue,
+        });
+      } else {
+        throw err;
+      }
+    }
     // The contract stores bookings under `_quote_key + "-" + str(sender)`
     // (travel_agent.py book()): "ORIG-DEST-depart-ret-0x<lowercase sender>".
     // writeContract returns only the tx hash, so rebuild the id exactly and

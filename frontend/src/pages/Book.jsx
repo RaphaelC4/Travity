@@ -106,17 +106,27 @@ export default function Book() {
     setBusy(true);
     try {
       // A reservation must exist at the agency before escrow: the PNR returned
-      // here is the anchor dispute escalation verifies against authenticated
-      // /status evidence. It cannot be made up by the client.
-      const reservationRef = await client.createReservation({
+      // here is the anchor settlement/dispute verifies against authenticated
+      // /provider-status evidence. The bound itinerary+passenger+offer must
+      // travel with it.
+      const binding = await client.createReservation({
         origin: form.origin, destination: form.destination,
         depart: form.depart, ret: form.ret,
       });
+      const reservationRef = typeof binding === "string" ? binding : binding.ref;
+      const offerId = typeof binding === "string" ? "" : binding.offerId;
+      const orderId = typeof binding === "string" ? "" : binding.duffelOrderId;
+      const pasId = typeof binding === "string" ? "" : binding.passengerId;
+      const itin = typeof binding === "string" ? "" : binding.itineraryJson;
       const res = await client.book({
         origin: form.origin, destination: form.destination,
         depart: form.depart, ret: form.ret,
         paymentWei: quote.escrowWei.toString(),
         reservationRef,
+        duffelOfferId: offerId,
+        duffelOrderId: orderId,
+        passengerId: pasId,
+        itineraryJson: itin,
         account: wallet.account,
         provider: wallet.provider,
       });
