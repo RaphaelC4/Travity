@@ -144,16 +144,20 @@ export default function Book() {
     if (!booking) return;
     setBusy(true);
     try {
-      // Deterministic settlement: succeeds once the return date has passed.
-      // No evidence fetch, no consensus — the contract applies a fixed rule.
+      // Settlement verifies booking-specific completed evidence via provider-status consensus
+      // and respects the 6h dispute window after 23:59:59 UTC of the return day.
       await client.settleBooking(booking.id, wallet.account, wallet.provider);
       setBooking((b) => ({ ...b, done: true }));
       showToast("Trip settled: fare paid to the operator and loyalty credits minted to your wallet.", "status");
     } catch (err) {
       const msg = err?.message || "unknown error";
       showToast(
-        /return date/i.test(msg)
-          ? "Settlement unlocks the day after your return date."
+        /dispute window/i.test(msg)
+          ? `Settlement blocked: ${msg} — try after 05:59 UTC on the day after return, or file a dispute if eligible.`
+          : /completion evidence/i.test(msg)
+          ? `Settlement blocked: ${msg} — carrier completed evidence (ref+order+passenger+itinerary) required.`
+          : /return date/i.test(msg)
+          ? "Settlement unlocks 6h after 23:59:59 UTC of your return day."
           : "Settlement failed: " + msg,
         "alert"
       );
@@ -273,7 +277,7 @@ export default function Book() {
                         Settle completed trip
                       </button>
                       <p className="hint" style={{ marginTop: 6 }}>
-                        Settlement unlocks the day after your return date — the contract applies a fixed rule, no review needed.
+                        Settlement unlocks 6h after 23:59:59 UTC of your return day and requires carrier completed evidence — otherwise file a dispute.
                       </p>
                     </>
                   )
