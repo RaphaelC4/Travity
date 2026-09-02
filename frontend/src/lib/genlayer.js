@@ -138,10 +138,8 @@ const isValidDates = (depart, ret) =>
 const isValidRef = (ref) =>
   typeof ref === "string" && /^[A-Z0-9]{4,12}$/.test(ref.trim());
 
-/** Issues a real reservation (PNR) at the quote server, returning the bound
- * tuple the contract seals in `book()`: ref + Duffel offer/order/passenger +
- * itinerary JSON. The ref is the anchor dispute escalation and settlement
- * verify against authenticated `/provider-status` evidence. */
+/** Holds a Duffel offer (no charge) — returns offer tuple for hold_booking.
+ * Purchase happens only after escrow via /api/confirm-purchase. */
 async function createReservation({ origin, destination, depart, ret, passenger, itineraryJson }) {
   const base = (import.meta.env.VITE_QUOTE_API || "").replace(/\/+$/, "");
   const res = await fetch(`${base}/api/reserve`, {
@@ -164,6 +162,8 @@ async function createReservation({ origin, destination, depart, ret, passenger, 
     duffelOrderId: String(j.duffelOrderId || j.duffel_order_id || ""),
     passengerId: String(j.passengerId || j.passenger_id || ""),
     itineraryJson: String(j.itinerary_json || j.itineraryJson || itineraryJson || ""),
+    totalAmount: j.totalAmount ?? null,
+    totalCurrency: j.totalCurrency ?? null,
   };
 }
 
@@ -379,6 +379,56 @@ export class TravityClient {
     });
     persistBookings(sessionBookings);
     return { id, onChainId, agreedWei: bookValue, reservationRef: ref };
+  }
+
+  async holdBooking({ origin, destination, depart, ret, duffelOfferId, passengerId, itineraryJson, paymentWei, account, provider }) {
+    const o = origin.toUpperCase(), d = destination.toUpperCase();
+    const dep = Number(depart), r = Number(ret);
+    if (!isValidRoute(o, d)) throw new Error("Invalid route.");
+    if (!isValidDates(dep, r)) throw new Error("Return date must be after departure date.");
+    const priceWei = BigInt(paymentWei ?? 0n);
+    if (priceWei <= 0n) throw new Error("Payment must be greater than zero.");
+    const offerId = String(duffelOfferId || "").trim();
+    const pasId = String(passengerId || "").trim();
+    const itin = String(itineraryJson || "").trim();
+    if (!offerId.startsWith("off_")) throw new Error("Offer id missing — hold an offer first.");
+    if (!pasId.startsWith("pas_")) throw new Error("Passenger id missing.");
+    if (!itin || itin.length < 10) throw new Error("Itinerary missing.");
+    const cached = await this.agreedQuote(o, d, dep, r);
+    let agreed = cached ? cached.priceWei : null;
+    if (!agreed) {
+      const client = await this.writeClient(account, provider);
+      await runWrite(client, { functionName: "refresh_quote", args: [o, d, dep, r], value: 0n });
+      const after = await this.agreedQuote(o, d, dep, r);
+      agreed = after ? after.priceWei : null;
+      if (!agreed) throw new Error("On-chain quote agreement failed.");
+    }
+    const bookValue = agreed > 0n ? agreed : priceWei;
+    const client = await this.writeClient(account, provider);
+    await runWrite(client, { functionName: "hold_booking", args: [o, d, dep, r, offerId, pasId, itin], value: bookValue });
+    const onChainId = await this.recallBookingId(o, d, dep, r, account);
+    sessionBookings.push({ id: onChainId, route: `${o}-${d}`, depart: dep, ret: r, priceWei: bookValue, status: "held", onChainId, offerId });
+    persistBookings(sessionBookings);
+    return { id: onChainId, agreedWei: bookValue, offerId, passengerId: pasId, itineraryJson: itin };
+  }
+
+  async confirmPurchase({ bookingId, orderId, locator, account, provider }) {
+    if (!bookingId) throw new Error("bookingId required");
+    if (!orderId.startsWith("ord_")) throw new Error("orderId must be ord_…");
+    if (!locator) throw new Error("locator required");
+    const client = await this.writeClient(account, provider);
+    await runWrite(client, { functionName: "confirm_purchase", args: [bookingId, orderId, locator], value: 0n });
+    const b = sessionBookings.find((x) => x.id === bookingId);
+    if (b) { b.status = "confirmed"; b.reservationRef = locator.toUpperCase(); persistBookings(sessionBookings); }
+    return { bookingId, orderId, locator };
+  }
+
+  async cancelHold({ bookingId, account, provider }) {
+    const client = await this.writeClient(account, provider);
+    await runWrite(client, { functionName: "cancel_hold", args: [bookingId], value: 0n });
+    const b = sessionBookings.find((x) => x.id === bookingId);
+    if (b) { b.status = "cancelled"; persistBookings(sessionBookings); }
+    return bookingId;
   }
 
   /** Rebuilds the contract's booking_id for (route, dates, sender) and confirms

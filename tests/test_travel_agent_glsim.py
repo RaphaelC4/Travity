@@ -26,8 +26,8 @@ ORDER_ID = "ord_test_order_12345678"
 PAS_ID = "pas_test_passenger_01"
 ITIN_JSON = json.dumps({"slices": [{"origin": "JFK", "destination": "LHR", "departure_date": "2025-01-01"}], "cabin_class": "economy", "passengers": [{"type": "adult"}]})
 
-def _provider_status_body(status="completed"):
-    return json.dumps({"ref": "PNRABC123", "duffel_order_id": ORDER_ID, "passenger_id": PAS_ID, "itinerary_json": ITIN_JSON, "offerId": OFFER_ID, "route": "JFK-LHR", "status": status})
+def _provider_status_body(status="completed", source="duffel-live"):
+    return json.dumps({"ref": "PNRABC123", "duffel_order_id": ORDER_ID, "passenger_id": PAS_ID, "itinerary_json": ITIN_JSON, "offerId": OFFER_ID, "route": "JFK-LHR", "status": status, "source": source, "aviation": {"flight_status": "landed"} if source == "aviationstack" else None})
 
 
 @pytest.fixture
@@ -61,13 +61,16 @@ def _book(direct_vm, agent, sender, depart=PAST_DEPART, ret=PAST_RET, ref="PNRAB
     _quote(direct_vm, agent, depart, ret)
     with direct_vm.prank(sender):
         direct_vm.value = PRICE
-        bid = agent.book("JFK", "LHR", depart, ret, ref, offer, order, pas, itin)
+        bid = agent.hold_booking("JFK", "LHR", depart, ret, offer, pas, itin)
     direct_vm.value = 0
+    with direct_vm.prank(sender):
+        agent.confirm_purchase(bid, order, ref)
     return bid
 
 def _mock_completion(direct_vm):
-    direct_vm.mock_web(rf"{FEED}/provider-status.*", {"status": 200, "body": _provider_status_body("completed")})
-    direct_vm.mock_llm(r".*", _provider_status_body("completed"))
+    body = _provider_status_body("completed", "duffel-live")
+    direct_vm.mock_web(rf"{FEED}/provider-status.*", {"status": 200, "body": body})
+    direct_vm.mock_llm(r".*", body)
 
 
 def test_full_lifecycle_settlement(direct_vm, agent, direct_owner, direct_alice, direct_charlie):

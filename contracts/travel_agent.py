@@ -62,6 +62,7 @@ class TravelAgent(gl.Contract):
     last_dispute_time: TreeMap[Address, u256]
     ref_used: TreeMap[str, str]        # reservation ref -> booking_id (global reuse guard)
     order_used: TreeMap[str, str]      # duffel order id -> booking_id (global reuse guard)
+    offer_used: TreeMap[str, str]      # duffel offer id -> booking_id (hold guard, 900s)
     feed_base: str                     # provider feed root; owner-adjustable
     provider_address: Address          # carrier/agency settlement payout address
 
@@ -286,28 +287,17 @@ class TravelAgent(gl.Contract):
     # -- Booking -------------------------------------------------------------
 
     @gl.public.write.payable
-    def book(self, origin: str, destination: str, depart: int, ret: int, reservation_ref: str, duffel_offer_id: str, duffel_order_id: str, passenger_id: str, itinerary_json: str) -> str:
-        """Escrow GEN for a booking bound to one verifiable purchase.
-
-        The quoted itinerary (itinerary_json), passenger (passenger_id =
-        Duffel pas_…), selected provider offer (duffel_offer_id = off_…),
-        reservation reference (PNR / Duffel booking_reference), and escrow
-        (msg.value vs agreed quote) are bound together before any purchase is
-        made. The server creates the Duffel order for exactly this tuple and
-        passes the resulting ids through here; the contract seals them. Over-
-        payment is credited to loyalty; underpayment or 2× grief reverts.
-        """
+    def hold_booking(self, origin: str, destination: str, depart: int, ret: int, duffel_offer_id: str, passenger_id: str, itinerary_json: str) -> str:
+        """Create on-chain booking record and lock escrow. No Duffel purchase
+        happens here and reservation_ref stays NULL — purchase is triggered
+        only after this succeeds, and confirm_purchase seals the receipt."""
         self._unpaused()
         if not self._valid_route(origin, destination):
             raise gl.vm.UserError("invalid route")
         if not self._valid_dates(depart, ret):
             raise gl.vm.UserError("invalid dates")
-        if not self._valid_ref(reservation_ref):
-            raise gl.vm.UserError("invalid reservation reference")
         if not isinstance(duffel_offer_id, str) or not duffel_offer_id.startswith("off_") or len(duffel_offer_id) < 8:
             raise gl.vm.UserError("invalid offer id")
-        if not isinstance(duffel_order_id, str) or not duffel_order_id.startswith("ord_") or len(duffel_order_id) < 8:
-            raise gl.vm.UserError("invalid order id")
         if not isinstance(passenger_id, str) or not passenger_id.startswith("pas_") or len(passenger_id) < 8:
             raise gl.vm.UserError("invalid passenger id")
         if not isinstance(itinerary_json, str) or len(itinerary_json) < 10 or len(itinerary_json) > 8000:
@@ -316,12 +306,7 @@ class TravelAgent(gl.Contract):
             _itin = json.loads(itinerary_json)
         except Exception:
             raise gl.vm.UserError("itinerary not valid JSON")
-        # Normalized to uppercase at write time so the dispute path (which
-        # uppercases the provider's echoed ref) can never mismatch on case
-        # alone.
-        ref = reservation_ref.strip().upper()
         offer_id = duffel_offer_id.strip()
-        order_id = duffel_order_id.strip()
         pas_id = passenger_id.strip()
 
         key = self._quote_key(origin, destination, depart, ret)
@@ -338,36 +323,125 @@ class TravelAgent(gl.Contract):
         sender = gl.message.sender_address
         booking_id = key + "-" + str(sender)
         if self.bookings.get(booking_id) is not None:
-            raise gl.vm.UserError("duplicate booking")
-        if self.ref_used.get(ref) is not None:
-            raise gl.vm.UserError("reservation reference already used")
-        if self.order_used.get(order_id) is not None:
-            raise gl.vm.UserError("order id already used")
+            # allow re-hold after cancelled/expired hold; otherwise duplicate
+            existing = json.loads(self.bookings.get(booking_id))
+            if existing.get("status") not in ("cancelled",):
+                # also allow if held but expired and not yet cancelled — will be reaped on next hold
+                if existing.get("status") == "held":
+                    try:
+                        if self._current_time() <= u256(int(existing.get("hold_expiry", 0))):
+                            raise gl.vm.UserError("duplicate booking")
+                    except Exception:
+                        raise gl.vm.UserError("duplicate booking")
+                else:
+                    raise gl.vm.UserError("duplicate booking")
+        existing_offer = self.offer_used.get(offer_id)
+        if existing_offer is not None and existing_offer != "":
+            rec_raw = self.bookings.get(existing_offer)
+            if rec_raw is not None:
+                try:
+                    rec_o = json.loads(rec_raw)
+                    if rec_o.get("status") not in ("cancelled",):
+                        # if held but expired, allow re-hold (cancel will have freed)
+                        if rec_o.get("status") == "held" and self._current_time() > u256(int(rec_o.get("hold_expiry", 0))):
+                            pass
+                        else:
+                            raise gl.vm.UserError("offer id already used")
+                except Exception as e:
+                    if "already used" in str(e):
+                        raise
+                    raise gl.vm.UserError("offer id already used")
 
         over = sent - price
+        hold_expiry = int(self._current_time()) + 900
         record = {
             "route": key,
             "customer": str(sender),
             "depart": depart,
             "ret": ret,
-            "reservation_ref": ref,
+            "reservation_ref": "",
             "offer_id": offer_id,
-            "duffel_order_id": order_id,
+            "duffel_order_id": "",
             "passenger_id": pas_id,
             "itinerary_json": itinerary_json,
             "price_wei": int(price),
             "paid_wei": int(sent),
-            "status": "confirmed",
+            "hold_expiry": hold_expiry,
+            "status": "held",
             "completion_verified": False,
             "settled": False,
             "settled_wei": 0,
         }
         self.bookings[booking_id] = json.dumps(record)
-        self.ref_used[ref] = booking_id
-        self.order_used[order_id] = booking_id
+        self.offer_used[offer_id] = booking_id
         if over > u256(0):
             self.loyalty[sender] = self.loyalty.get(sender, u256(0)) + over
         return booking_id
+
+    @gl.public.write
+    def confirm_purchase(self, bookingId: str, order_id: str, locator: str) -> None:
+        """Sealed on-chain write for the purchase receipt. Caller MUST be
+        booking.customer; enforces order_used uniqueness and hold_expiry."""
+        self._unpaused()
+        if not isinstance(bookingId, str) or not bookingId:
+            raise gl.vm.UserError("invalid booking id")
+        if not isinstance(order_id, str) or not order_id.startswith("ord_") or len(order_id) < 8:
+            raise gl.vm.UserError("invalid order id")
+        if not self._valid_ref(locator):
+            raise gl.vm.UserError("invalid locator")
+        raw = self.bookings.get(bookingId)
+        if raw is None:
+            raise gl.vm.UserError("unknown booking")
+        booking = json.loads(raw)
+        if booking.get("status") != "held":
+            raise gl.vm.UserError("booking not in held state")
+        if self._current_time() > u256(int(booking.get("hold_expiry", 0))):
+            raise gl.vm.UserError("hold expired")
+        if str(gl.message.sender_address) != str(booking.get("customer")):
+            raise gl.vm.UserError("only booking customer")
+        order_clean = order_id.strip()
+        loc_clean = locator.strip().upper()
+        if self.order_used.get(order_clean) is not None:
+            raise gl.vm.UserError("order id already used")
+        if self.ref_used.get(loc_clean) is not None:
+            raise gl.vm.UserError("reservation reference already used")
+        # seal
+        booking["duffel_order_id"] = order_clean
+        booking["reservation_ref"] = loc_clean
+        booking["status"] = "confirmed"
+        self.bookings[bookingId] = json.dumps(booking)
+        self.order_used[order_clean] = bookingId
+        self.ref_used[loc_clean] = bookingId
+
+    @gl.public.write
+    def cancel_hold(self, bookingId: str) -> None:
+        """Release escrow if hold_expiry passed and confirm_purchase never arrived."""
+        self._unpaused()
+        raw = self.bookings.get(bookingId)
+        if raw is None:
+            raise gl.vm.UserError("unknown booking")
+        booking = json.loads(raw)
+        if booking.get("status") != "held":
+            raise gl.vm.UserError("booking not in held state")
+        if self._current_time() <= u256(int(booking.get("hold_expiry", 0))):
+            # only customer can cancel early? spec: callable once hold_expiry passed
+            raise gl.vm.UserError("hold still active")
+        # also allow customer to cancel anytime after expiry; no other sender check needed for expiry path
+        # free offer guard so offer can be reused after cancel
+        offer_id = str(booking.get("offer_id", ""))
+        if offer_id and self.offer_used.get(offer_id) is not None:
+            self.offer_used[offer_id] = ""
+        price = u256(int(booking.get("price_wei", 0)))
+        customer = Address(booking.get("customer"))
+        # mark cancelled before transfer (checks-effects-interactions)
+        booking["status"] = "cancelled"
+        self.bookings[bookingId] = json.dumps(booking)
+        if price > u256(0):
+            _Payee(customer).emit_transfer(value=price)
+
+    @gl.public.write.payable
+    def book(self, origin: str, destination: str, depart: int, ret: int, reservation_ref: str, duffel_offer_id: str, duffel_order_id: str, passenger_id: str, itinerary_json: str) -> str:
+        raise gl.vm.UserError("deprecated: use hold_booking then confirm_purchase")
 
     def _require_completion_evidence(self, booking: dict) -> None:
         """Verify booking-specific completion evidence via provider-status.
@@ -422,7 +496,10 @@ class TravelAgent(gl.Contract):
                     except Exception:
                         if page_itin != itin.strip():
                             return ""
-                # completed signal: duffel-live or aviation landed, or carrier completed
+                # completed signal: must be live carrier evidence, not date-rule
+                source = str(page.get("source", "")).strip()
+                if source not in ("duffel-live", "aviationstack"):
+                    return ""
                 st = str(page.get("status", "")).strip().lower()
                 av = page.get("aviation") if isinstance(page.get("aviation"), dict) else None
                 avs = str(av.get("flight_status", "")).strip().lower() if av else ""
@@ -438,6 +515,11 @@ class TravelAgent(gl.Contract):
         )
         if not agreed or not str(agreed).strip():
             raise gl.vm.UserError("completion evidence not verified for this booking")
+
+    @gl.public.write
+    def confirm_completion(self, booking_id: str) -> None:
+        """Mark booking complete after live carrier evidence (duffel-live/aviation). No date-rule escape."""
+        self.settle_booking(booking_id)
 
     @gl.public.write
     def settle_booking(self, booking_id: str) -> None:

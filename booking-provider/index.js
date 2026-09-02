@@ -162,6 +162,62 @@ app.post("/book", limiter, async (req, res) => {
   return res.status(503).json({ error: "booking provider not configured: DUFFEL_API_KEY missing" });
 });
 
+// Offer hold — free, no Duffel charge. Returns off_… for hold_booking.
+app.post("/offer-hold", limiter, async (req, res) => {
+  const from = String(req.body?.from ?? "").trim().toUpperCase();
+  const to = String(req.body?.to ?? "").trim().toUpperCase();
+  const departRaw = String(req.body?.depart ?? "").trim();
+  const departIso = toIso(departRaw) ?? departRaw;
+  if (!IATA_RE.test(from) || !IATA_RE.test(to) || from === to) return res.status(400).json({ error: "from/to must be distinct 3-letter IATA codes" });
+  if (!departIso || Number.isNaN(Date.parse(departIso))) return res.status(400).json({ error: "depart must be YYYYMMDD" });
+  const duffelKey = String(process.env.DUFFEL_API_KEY || "").trim();
+  if (!duffelKey) return res.status(503).json({ error: "booking provider not configured: DUFFEL_API_KEY missing" });
+  try {
+    const offerReq = await fetch("https://api.duffel.com/air/offer_requests", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${duffelKey}`, "Duffel-Version": "v2", "Content-Type": "application/json" },
+      body: JSON.stringify({ data: { slices: [{ origin: from, destination: to, departure_date: departIso }], passengers: [{ type: "adult" }], cabin_class: "economy" } }),
+    });
+    if (!offerReq.ok) throw new Error(`Duffel offer_requests ${offerReq.status}`);
+    const offerJson = await offerReq.json();
+    const offer = offerJson.data?.offers?.[0] ?? offerJson.data?.offer_requests?.[0]?.offers?.[0];
+    if (!offer?.id) throw new Error("Duffel returned no offers");
+    const passengerId = offer.passengers?.[0]?.id ?? "pas_00000000000000";
+    const itineraryJson = JSON.stringify({ slices: offer.slices, passengers: offer.passengers, cabin_class: "economy" });
+    return res.json({ offerId: offer.id, passengerId, itinerary_json: itineraryJson, expiresAt: offer.expires_at ?? null, totalAmount: offer.total_amount, totalCurrency: offer.total_currency });
+  } catch (e) {
+    return res.status(502).json({ error: `offer-hold failed: ${e.message}` });
+  }
+});
+
+// Confirm — creates real Duffel order after escrow. Caller must have held offer.
+app.post("/confirm", limiter, async (req, res) => {
+  const offerId = String(req.body?.offerId ?? req.body?.offer_id ?? "").trim();
+  const pasId = String(req.body?.passengerId ?? req.body?.passenger_id ?? "").trim();
+  const totalAmount = String(req.body?.totalAmount ?? req.body?.total_amount ?? "").trim();
+  const totalCurrency = String(req.body?.totalCurrency ?? req.body?.total_currency ?? "USD").trim() || "USD";
+  if (!offerId.startsWith("off_")) return res.status(400).json({ error: "offerId required" });
+  if (!totalAmount) return res.status(400).json({ error: "totalAmount required (from offer-hold)" });
+  const duffelKey = String(process.env.DUFFEL_API_KEY || "").trim();
+  if (!duffelKey) return res.status(503).json({ error: "booking provider not configured: DUFFEL_API_KEY missing" });
+  try {
+    const orderRes = await fetch("https://api.duffel.com/air/orders", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${duffelKey}`, "Duffel-Version": "v2", "Content-Type": "application/json" },
+      body: JSON.stringify({ data: { type: "instant", selected_offers: [offerId], passengers: [{ id: pasId || "pas_00000000000000", given_name: "John", family_name: "Doe", born_on: "1990-01-01", gender: "m", title: "mr", email: "john.doe@example.com", phone_number: "+14155551234" }], payments: [{ type: "balance", amount: totalAmount, currency: totalCurrency }] } }),
+    });
+    if (!orderRes.ok) {
+      const txt = await orderRes.text().catch(() => "");
+      throw new Error(`Duffel create order ${orderRes.status}: ${txt.slice(0, 200)}`);
+    }
+    const orderJson = await orderRes.json();
+    const locator = String(orderJson.data?.booking_reference ?? orderJson.data?.id ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
+    return res.json({ duffelOrderId: orderJson.data?.id ?? null, locator, refundPolicy: refundPolicyFrom(orderJson.data?.conditions) });
+  } catch (e) {
+    return res.status(502).json({ error: `confirm failed: ${e.message}` });
+  }
+});
+
 // Live, independent re-verification: re-fetches the order directly from
 // Duffel at dispute time instead of trusting whatever this server has
 // cached locally. This is what the dispute path calls through

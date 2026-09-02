@@ -105,32 +105,39 @@ export default function Book() {
     if (!quote) return;
     setBusy(true);
     try {
-      // A reservation must exist at the agency before escrow: the PNR returned
-      // here is the anchor settlement/dispute verifies against authenticated
-      // /provider-status evidence. The bound itinerary+passenger+offer must
-      // travel with it.
-      const binding = await client.createReservation({
+      // Two-step: 1) hold offer (no Duffel charge), 2) escrow on-chain, 3) purchase Duffel, 4) seal receipt
+      const hold = await client.createReservation({
         origin: form.origin, destination: form.destination,
         depart: form.depart, ret: form.ret,
       });
-      const reservationRef = typeof binding === "string" ? binding : binding.ref;
-      const offerId = typeof binding === "string" ? "" : binding.offerId;
-      const orderId = typeof binding === "string" ? "" : binding.duffelOrderId;
-      const pasId = typeof binding === "string" ? "" : binding.passengerId;
-      const itin = typeof binding === "string" ? "" : binding.itineraryJson;
-      const res = await client.book({
+      const offerId = hold.offerId || hold.offer_id || "";
+      const pasId = hold.passengerId || hold.passenger_id || "";
+      const itin = hold.itineraryJson || hold.itinerary_json || "";
+      if (!offerId) throw new Error("Offer hold failed — no offerId returned");
+      const holdRes = await client.holdBooking({
         origin: form.origin, destination: form.destination,
         depart: form.depart, ret: form.ret,
-        paymentWei: quote.escrowWei.toString(),
-        reservationRef,
         duffelOfferId: offerId,
-        duffelOrderId: orderId,
         passengerId: pasId,
         itineraryJson: itin,
+        paymentWei: quote.escrowWei.toString(),
         account: wallet.account,
         provider: wallet.provider,
       });
-      setBooking({ id: res.id, route: quote.route, priceWei: res.agreedWei, reservationRef: res.reservationRef });
+      // Purchase Duffel after escrow is locked
+      const base = (import.meta.env.VITE_QUOTE_API || "").replace(/\/+$/, "");
+      const confRes = await fetch(`${base}/api/confirm-purchase`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bookingId: holdRes.id, offerId, passengerId: pasId }),
+      });
+      const confJson = await confRes.json().catch(() => ({}));
+      if (!confRes.ok) throw new Error(confJson.error || `Duffel purchase failed (${confRes.status})`);
+      const orderId = String(confJson.duffelOrderId || confJson.orderId || "");
+      const locator = String(confJson.locator || "");
+      if (!orderId || !locator) throw new Error("Confirm purchase failed — no order/locator returned");
+      await client.confirmPurchase({ bookingId: holdRes.id, orderId, locator, account: wallet.account, provider: wallet.provider });
+      setBooking({ id: holdRes.id, route: quote.route, priceWei: holdRes.agreedWei, reservationRef: locator.toUpperCase() });
       setQuote(null);
       showToast(`Trip booked (PNR ${reservationRef}): fare escrowed at the on-chain agreed price (network gas was charged separately).`, "status");
     } catch (err) {
