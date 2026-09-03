@@ -1,8 +1,20 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 from genlayer import *
 import json
+import re
 import typing
 from datetime import datetime, timezone
+
+
+def _parse_wei_number(raw) -> int:
+    """Extract trailing integer from LLM output. Strips <think> tags, markdown, prose."""
+    s = str(raw) if raw is not None else ""
+    s = re.sub(r"<[^>]*>", " ", s)
+    s = s.replace(",", "")
+    nums = re.findall(r"\d+", s)
+    if not nums:
+        raise ValueError("no digits")
+    return int(nums[-1])
 
 RANGE_PRICE_MAX = u256(10 ** 24)          # wei ceiling: allows real fares (~1e20-1e22 wei)
 DISPUTE_INTERVAL_SECONDS = 600            # 10 min; GenVM exposes tx time, not block height
@@ -263,7 +275,7 @@ class TravelAgent(gl.Contract):
             page = res.body.decode("utf-8")
             return gl.nondet.exec_prompt(
                 "Extract the total ticket price in integer wei from this "
-                "page and reply with only the number: " + page[:4000]
+                "page. Reply with ONLY the integer, no tags/think/markdown: " + page[:4000]
             )
 
         # strict_eq must never be used on LLM output (it's non-deterministic
@@ -275,7 +287,7 @@ class TravelAgent(gl.Contract):
             "to 5% difference due to live price fluctuation.",
         )
         try:
-            price = u256(int(str(agreed).strip()))
+            price = u256(_parse_wei_number(agreed))
         except Exception:
             raise gl.vm.UserError("unreadable price")
         if price <= u256(0) or price > RANGE_PRICE_MAX:
@@ -756,7 +768,7 @@ class TravelAgent(gl.Contract):
             "up to 10% difference given the judgment call involved.",
         )
         try:
-            refund = u256(int(str(agreed).strip()))
+            refund = u256(_parse_wei_number(agreed))
         except Exception:
             refund = u256(0)
         if refund > price_max:
