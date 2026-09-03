@@ -213,16 +213,23 @@ async function createBookingViaProvider(from, to, departIso, retIso, passenger, 
 
 async function createHoldViaProvider(from, to, departIso) {
   const base = String(process.env.BOOKING_PROVIDER_URL || "").trim().replace(/\/book\/?$/, "");
-  if (!base) return null;
+  if (!base) throw new Error("BOOKING_PROVIDER_URL not configured");
   const url = `${base}/offer-hold`;
   const apiKey = String(process.env.BOOKING_PROVIDER_API_KEY || "").trim();
+  let res;
   try {
-    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) }, body: JSON.stringify({ from, to, depart: departIso }) });
-    if (!res.ok) return null;
-    const j = await res.json().catch(() => ({}));
-    if (!j.offerId) return null;
-    return { offerId: j.offerId, passengerId: j.passengerId, itineraryJson: j.itinerary_json, expiresAt: j.expiresAt, totalAmount: j.totalAmount, totalCurrency: j.totalCurrency };
-  } catch { return null; }
+    res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) }, body: JSON.stringify({ from, to, depart: departIso }) });
+  } catch (e) {
+    console.error("[quote-server] offer-hold network failed:", e.message);
+    throw new Error(`offer-hold unreachable: ${e.message}`);
+  }
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    console.error("[quote-server] offer-hold failed:", res.status, j.error || "");
+    throw new Error(j.error || `offer-hold failed (${res.status})`);
+  }
+  if (!j.offerId) throw new Error("offer-hold returned no offerId");
+  return { offerId: j.offerId, passengerId: j.passengerId, itineraryJson: j.itinerary_json, expiresAt: j.expiresAt, totalAmount: j.totalAmount, totalCurrency: j.totalCurrency };
 }
 
 async function createOrderViaProvider(offerId, passengerId, totalAmount, totalCurrency) {
@@ -825,6 +832,7 @@ app.get("/health", (_req, res) => {
     rapid: { configured: Boolean(RAPID.apiKey) },
     kiwi: { configured: Boolean(KIWI.apiKey) },
     omkar: { configured: Boolean(OMKAR.apiKey) },
+    bookingProvider: { configured: Boolean(BOOKING_PROVIDER_URL), url: BOOKING_PROVIDER_URL ? "set" : "missing" },
     outage: Boolean(cache.outageUntil && Date.now() < cache.outageUntil),
     outage_until_ms: cache.outageUntil || null,
     evidence: { mode: "hmac", secret_configured: Boolean(PNR_SECRET) },
@@ -920,9 +928,8 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
     let offerHold;
     try {
       offerHold = await createHoldViaProvider(f, t, d);
-      if (!offerHold) return res.status(502).json({ error: "booking provider failed to hold offer" });
     } catch (e) {
-      return res.status(502).json({ error: `offer hold failed: ${e.message}` });
+      return res.status(502).json({ error: `booking provider failed to hold offer: ${e.message}` });
     }
     var offerId = offerHold.offerId;
     var passengerId = offerHold.passengerId;

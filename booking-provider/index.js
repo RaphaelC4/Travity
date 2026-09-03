@@ -34,7 +34,7 @@ app.use((_, res, next) => {
   next();
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "travity-booking-provider" }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "travity-booking-provider", duffelConfigured: Boolean(String(process.env.DUFFEL_API_KEY || "").trim()) }));
 
 const limiter = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false });
 
@@ -186,6 +186,7 @@ app.post("/offer-hold", limiter, async (req, res) => {
     const itineraryJson = JSON.stringify({ slices: offer.slices, passengers: offer.passengers, cabin_class: "economy" });
     return res.json({ offerId: offer.id, passengerId, itinerary_json: itineraryJson, expiresAt: offer.expires_at ?? null, totalAmount: offer.total_amount, totalCurrency: offer.total_currency });
   } catch (e) {
+    console.error("[booking-provider] offer-hold failed:", e.message);
     return res.status(502).json({ error: `offer-hold failed: ${e.message}` });
   }
 });
