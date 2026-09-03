@@ -137,9 +137,10 @@ export default function Book() {
       const locator = String(confJson.locator || "");
       if (!orderId || !locator) throw new Error("Confirm purchase failed — no order/locator returned");
       await client.confirmPurchase({ bookingId: holdRes.id, orderId, locator, account: wallet.account, provider: wallet.provider });
-      setBooking({ id: holdRes.id, route: quote.route, priceWei: holdRes.agreedWei, reservationRef: locator.toUpperCase() });
+      const sealedRef = locator.toUpperCase();
+      setBooking({ id: holdRes.id, route: quote.route, priceWei: holdRes.agreedWei, reservationRef: sealedRef });
       setQuote(null);
-      showToast(`Trip booked (PNR ${reservationRef}): fare escrowed at the on-chain agreed price (network gas was charged separately).`, "status");
+      showToast(`Trip booked (PNR ${sealedRef}): fare escrowed at the on-chain agreed price (network gas was charged separately).`, "status");
     } catch (err) {
       showToast("Booking failed: " + (err.message || "unknown error"), "alert");
     } finally {

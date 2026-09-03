@@ -940,8 +940,8 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
       ret: r,
       provider: "booking-provider",
       flights: bindingFlights ?? [],
-      providerOrderId: providerOrderId ?? null,
-      refundPolicy: refundPolicy ?? null,
+      providerOrderId: null,
+      refundPolicy: null,
       offerId: offerId ?? null,
       passenger_id: passengerId ?? null,
       itinerary_json: boundItineraryJson ?? null,
@@ -959,8 +959,6 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
     if (!record.flights || !record.flights.length) {
       record.flights = bindingFlights;
     }
-    if (!record.providerOrderId && providerOrderId) record.providerOrderId = providerOrderId;
-    if (!record.refundPolicy && refundPolicy) record.refundPolicy = refundPolicy;
     if (!record.offerId && offerId) record.offerId = offerId;
     if (!record.passenger_id && passengerId) record.passenger_id = passengerId;
     if (!record.itinerary_json && boundItineraryJson) record.itinerary_json = boundItineraryJson;
