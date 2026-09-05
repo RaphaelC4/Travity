@@ -69,6 +69,24 @@ export default function Book() {
     persistBookState(form, quote, booking);
   }, [form, quote, booking]);
 
+  useEffect(() => {
+    // Sync with on-chain status (held/confirmed/completed) on mount and after writes
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await client.bookings();
+        if (cancelled) return;
+        if (booking && list.length) {
+          const live = list.find((b) => b.id === booking.id || b.onChainId === booking.id);
+          if (live && live.status && live.status !== booking.status) {
+            setBooking((prev) => prev ? { ...prev, status: live.status, completion: live.completion, reservationRef: live.reservationRef || prev.reservationRef } : prev);
+          }
+        }
+      } catch {}
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   const set = (k) => (e) => {
     setErrors((prev) => ({ ...prev, [k]: undefined }));
     setForm((f) => ({ ...f, [k]: e.target.value }));
@@ -138,7 +156,9 @@ export default function Book() {
       if (!orderId || !locator) throw new Error("Confirm purchase failed — no order/locator returned");
       await client.confirmPurchase({ bookingId: holdRes.id, orderId, locator, account: wallet.account, provider: wallet.provider });
       const sealedRef = locator.toUpperCase();
-      setBooking({ id: holdRes.id, route: quote.route, priceWei: holdRes.agreedWei, reservationRef: sealedRef });
+      setBooking({ id: holdRes.id, route: quote.route, priceWei: holdRes.agreedWei, reservationRef: sealedRef, status: "confirmed", completion: false });
+      // pull live confirmed status to ensure chain view matches
+      try { const live = await client.bookings(); const found = live.find((b) => b.id === holdRes.id); if (found) setBooking((prev) => ({ ...prev, status: found.status || "confirmed" })); } catch {}
       setQuote(null);
       showToast(`Trip booked (PNR ${sealedRef}): fare escrowed at the on-chain agreed price (network gas was charged separately).`, "status");
     } catch (err) {
@@ -152,10 +172,10 @@ export default function Book() {
     if (!booking) return;
     setBusy(true);
     try {
-      // Settlement verifies booking-specific completed evidence via provider-status consensus
-      // and respects the 6h dispute window after 23:59:59 UTC of the return day.
+      // Settlement verifies booking-specific completed evidence (duffel-live/aviation) and 6h window
       await client.settleBooking(booking.id, wallet.account, wallet.provider);
-      setBooking((b) => ({ ...b, done: true }));
+      setBooking((b) => ({ ...b, done: true, status: "completed", completion: true }));
+      try { const live = await client.bookings(); const found = live.find((x) => x.id === booking.id); if (found) setBooking((prev) => ({ ...prev, status: found.status, completion: found.completion })); } catch {}
       showToast("Trip settled: fare paid to the operator and loyalty credits minted to your wallet.", "status");
     } catch (err) {
       const msg = err?.message || "unknown error";
@@ -275,8 +295,8 @@ export default function Book() {
                 {booking.reservationRef && (
                   <div className="list-line"><span className="k">Reservation ref</span><span className="v mono">{booking.reservationRef}</span></div>
                 )}
-                <div className="list-line"><span className="k">Status</span><span className="v"><span className="pill pill-accepted">CONFIRMED</span></span></div>
-                {!booking.done ? (
+                <div className="list-line"><span className="k">Status</span><span className="v"><span className={`pill ${booking.status === "completed" ? "pill-completed" : booking.status === "held" ? "pill-held" : "pill-accepted"}`}>{(booking.status || (booking.done ? "completed" : "confirmed")).toUpperCase()}</span></span></div>
+                {(booking.status !== "completed" && !booking.done) ? (
                   needsWallet ? (
                     <WalletButton label="Connect to settle trip" onError={(m) => showToast(m, "alert")} />
                   ) : (
@@ -293,9 +313,9 @@ export default function Book() {
                   <div className="list-line"><span className="k">Rewards</span><span className="v">Loyalty minted</span></div>
                 )}
                 <div className="lifecycle" aria-label="Booking lifecycle">
-                  <span className={`step ${booking.done ? "" : "is-active"}`}><b>1</b> Pending</span><span className="connector" aria-hidden="true" />
-                  <span className="step is-active"><b>2</b> Accepted</span><span className="connector" aria-hidden="true" />
-                  <span className={`step ${booking.done ? "is-active" : ""}`}><b>3</b> Finalized</span>
+                  <span className={`step ${booking.status === "held" ? "is-active" : ""}`}><b>1</b> Held</span><span className="connector" aria-hidden="true" />
+                  <span className={`step ${booking.status === "confirmed" ? "is-active" : booking.status === "completed" ? "" : ""}`}><b>2</b> Confirmed</span><span className="connector" aria-hidden="true" />
+                  <span className={`step ${booking.status === "completed" || booking.done ? "is-active" : ""}`}><b>3</b> Completed</span>
                 </div>
               </div>
             )}

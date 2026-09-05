@@ -38,6 +38,9 @@ app.get("/health", (_req, res) => res.json({ ok: true, service: "travity-booking
 
 const limiter = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false });
 
+const _offerCache = new Map();
+const OFFER_TTL_MS = 30_000;
+
 // Turn a Duffel order's `conditions` block into a plain refund-policy summary
 // the dispute LLM can weigh directly, instead of raw nested JSON it would
 // have to interpret on its own. Duffel exposes refund_before_departure /
@@ -172,22 +175,41 @@ app.post("/offer-hold", limiter, async (req, res) => {
   if (!departIso || Number.isNaN(Date.parse(departIso))) return res.status(400).json({ error: "depart must be YYYYMMDD" });
   const duffelKey = String(process.env.DUFFEL_API_KEY || "").trim();
   if (!duffelKey) return res.status(503).json({ error: "booking provider not configured: DUFFEL_API_KEY missing" });
+  const cacheKey = `${from}|${to}|${departIso}`;
+  const cached = _offerCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < OFFER_TTL_MS) {
+    return res.json(cached.value);
+  }
   try {
-    const offerReq = await fetch("https://api.duffel.com/air/offer_requests", {
+    const doFetch = async () => fetch("https://api.duffel.com/air/offer_requests", {
       method: "POST",
       headers: { Authorization: `Bearer ${duffelKey}`, "Duffel-Version": "v2", "Content-Type": "application/json" },
       body: JSON.stringify({ data: { slices: [{ origin: from, destination: to, departure_date: departIso }], passengers: [{ type: "adult" }], cabin_class: "economy" } }),
     });
+    let offerReq = await doFetch();
+    if (offerReq.status === 429) {
+      const retryAfter = offerReq.headers.get("retry-after");
+      console.warn(`[booking-provider] Duffel 429, retry-after=${retryAfter}`);
+      // brief backoff and single retry
+      await new Promise((r) => setTimeout(r, 2000));
+      offerReq = await doFetch();
+      if (offerReq.status === 429) {
+        return res.status(429).json({ error: "Duffel rate limited (429), please retry in a few seconds", retryAfter: retryAfter || "2" });
+      }
+    }
     if (!offerReq.ok) throw new Error(`Duffel offer_requests ${offerReq.status}`);
     const offerJson = await offerReq.json();
     const offer = offerJson.data?.offers?.[0] ?? offerJson.data?.offer_requests?.[0]?.offers?.[0];
     if (!offer?.id) throw new Error("Duffel returned no offers");
     const passengerId = offer.passengers?.[0]?.id ?? "pas_00000000000000";
     const itineraryJson = JSON.stringify({ slices: offer.slices, passengers: offer.passengers, cabin_class: "economy" });
-    return res.json({ offerId: offer.id, passengerId, itinerary_json: itineraryJson, expiresAt: offer.expires_at ?? null, totalAmount: offer.total_amount, totalCurrency: offer.total_currency });
+    const value = { offerId: offer.id, passengerId, itinerary_json: itineraryJson, expiresAt: offer.expires_at ?? null, totalAmount: offer.total_amount, totalCurrency: offer.total_currency };
+    _offerCache.set(cacheKey, { ts: Date.now(), value });
+    return res.json(value);
   } catch (e) {
     console.error("[booking-provider] offer-hold failed:", e.message);
-    return res.status(502).json({ error: `offer-hold failed: ${e.message}` });
+    const is429 = /429/.test(e.message);
+    return res.status(is429 ? 429 : 502).json({ error: `offer-hold failed: ${e.message}` });
   }
 });
 

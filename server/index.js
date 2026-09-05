@@ -929,7 +929,8 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
     try {
       offerHold = await createHoldViaProvider(f, t, d);
     } catch (e) {
-      return res.status(502).json({ error: `booking provider failed to hold offer: ${e.message}` });
+      const is429 = /429/.test(e.message);
+      return res.status(is429 ? 429 : 502).json({ error: `booking provider failed to hold offer: ${e.message}`, retryAfter: is429 ? 3 : undefined });
     }
     var offerId = offerHold.offerId;
     var passengerId = offerHold.passengerId;
