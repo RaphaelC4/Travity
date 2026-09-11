@@ -124,10 +124,23 @@ export default function Book() {
     setBusy(true);
     try {
       // Two-step: 1) hold offer (no Duffel charge), 2) escrow on-chain, 3) purchase Duffel, 4) seal receipt
-      const hold = await client.createReservation({
-        origin: form.origin, destination: form.destination,
-        depart: form.depart, ret: form.ret,
-      });
+      let hold;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          hold = await client.createReservation({
+            origin: form.origin, destination: form.destination,
+            depart: form.depart, ret: form.ret,
+          });
+          break;
+        } catch (e) {
+          if (/429/.test(e.message) && attempt === 0) {
+            showToast("Duffel is busy (429) — retrying in 3s…", "status");
+            await new Promise((r) => setTimeout(r, 3000));
+            continue;
+          }
+          throw e;
+        }
+      }
       const offerId = hold.offerId || hold.offer_id || "";
       const pasId = hold.passengerId || hold.passenger_id || "";
       const itin = hold.itineraryJson || hold.itinerary_json || "";
