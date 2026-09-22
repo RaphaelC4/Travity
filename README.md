@@ -88,7 +88,8 @@ Set in `booking-provider/.env` / Render `travity-booking-provider`: `DUFFEL_API_
 5. On the Book page connect your wallet — **Hold** locks escrow (`HELD`), **Confirm purchase** seals Duffel `ord_…`/`PNR` (`CONFIRMED`), **Settle** after `duffel-live completed`/`aviation landed` + `6h` window → `COMPLETED` + loyalty. `Review & pay` pills derive `HELD`/`CONFIRMED`/`COMPLETED` from `view_booking` and refresh on mount + after each write.
 
 Deployed contracts (Studionet):
-- `0x601e602C50bc2048ac8033C21e16Ce4D3712e48D` — `105ed6a` hold→confirm build (current, use this)
+- `0x93917fdeb92E31B108F002368229d8bbE9C7406e` — `v3-hold-confirm` (`f82142c`) hold→confirm build (current, use this)
+- `0x601e602C50bc2048ac8033C21e16Ce4D3712e48D` — `105ed6a` hold→confirm build (superseded)
 - `0x774eFD6bB076fCB270e1bb596d8c0335e5895D27` — legacy 9-arg book (deprecated)
 
 The contract exposes: `hold_booking(origin,destination,depart,ret,off_…,pas_…,itinerary_json)` payable 7-arg (no `ref`/`ord_…`, `900s` hold, `offer_used`), `confirm_purchase(bookingId,ord_…,locator)` customer-only 3-arg seals receipt (`order_used`/`ref_used` uniqueness, `hold_expired` check), `cancel_hold(bookingId)` refunds after `900s`, `confirm_completion`/`settle_booking`/`force_complete` (permissionless/owner but same `6h` + `provider-status` `source in (duffel-live,aviationstack)` + `completed`/`landed` via `prompt_comparative`, no `date-rule` escape, no operator bypass), `book` 9-arg — **deprecated, reverts "use hold_booking then confirm_purchase"** — plus `file_dispute`/`escalate` (one-shot AI refund with `refund_policy` + `aviation.flight_status`), `balance_of`, `view_booking`/`view_dispute`/`view_provider_config`.

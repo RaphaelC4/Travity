@@ -70,7 +70,7 @@ services:
       - key: VITE_GENLAYER_RPC
         value: https://studio.genlayer.com/api
       - key: VITE_GENLAYER_CONTRACT_ADDRESS
-        value: 0x3D3F1dd4fe7f044DBA73BE7A434603282638965C
+        value: 0x93917fdeb92E31B108F002368229d8bbE9C7406e
       - key: VITE_GENLAYER_CHAIN_ID
         value: "61999"
       # Public quote server origin — also the on-chain feed root set via

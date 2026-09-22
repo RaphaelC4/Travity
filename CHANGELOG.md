@@ -1,5 +1,16 @@
 # Changelog
 
+## v3 — hold→confirm booking protection (`v3-hold-confirm`)
+
+Two-step `hold_booking` 7-arg (escrow, no `ref`, `900s`) → Duffel purchase →
+`confirm_purchase` customer-only seals `order_used`/`ref_used`; `cancel_hold`
+refunds after expiry. Settlement requires live `duffel-live`/`aviationstack`
+`completed`/`landed` (no `date-rule` escape, no relabel); `POST
+/api/confirm-purchase` dual-auth + idempotent. `14 passed` Direct Mode.
+
+Deployed contract for this build (Studionet):
+`0x93917fdeb92E31B108F002368229d8bbE9C7406e`
+
 ## v2 — resubmission addressing review feedback
 
 Reviewer request: *"The settlement-authority fix is present, but the requested
