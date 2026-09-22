@@ -155,11 +155,16 @@ export default function Book() {
         account: wallet.account,
         provider: wallet.provider,
       });
-      // Purchase Duffel after escrow is locked
+      // Purchase Duffel after escrow is locked (dual-auth: wallet identity, operator cron uses bearer)
+      const walletSig = await client.signConfirmPurchase({ bookingId: holdRes.id, offerId, account: wallet.account, provider: wallet.provider });
       const base = (import.meta.env.VITE_QUOTE_API || "").replace(/\/+$/, "");
       const confRes = await fetch(`${base}/api/confirm-purchase`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-Wallet-Address": wallet.account,
+          "X-Wallet-Signature": walletSig,
+        },
         body: JSON.stringify({ bookingId: holdRes.id, offerId, passengerId: pasId }),
       });
       const confJson = await confRes.json().catch(() => ({}));

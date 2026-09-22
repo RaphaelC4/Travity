@@ -78,6 +78,40 @@ def test_hold_confirm_completion_and_uniqueness(direct_vm, agent, direct_alice, 
     assert rec["settled"] is True
 
 
+def test_date_rule_and_live_confirmed_do_not_settle(direct_vm, agent, direct_alice, direct_owner):
+    """Confirmed-but-not-completed must not settle: date-rule completed and
+    live-confirmed (merely paid, future segments) both revert."""
+    agent.set_provider(direct_owner)
+    bid = _hold(direct_vm, agent, direct_alice)
+    with direct_vm.prank(direct_alice):
+        agent.confirm_purchase(bid, ORDER_ID, LOCATOR)
+    # date-rule inference must revert even with status completed
+    date_rule = json.dumps({"ref": LOCATOR, "duffel_order_id": ORDER_ID, "passenger_id": PAS_ID, "itinerary_json": ITIN_JSON, "offerId": OFFER_ID, "route": "JFK-LHR", "status": "completed", "source": "date-rule"})
+    direct_vm.mock_web(rf"{FEED}/provider-status\?ref={LOCATOR}.*", {"status": 200, "body": date_rule})
+    direct_vm.mock_llm(r".*", date_rule)
+    with pytest.raises(Exception, match="completion evidence"):
+        agent.confirm_completion(bid)
+    # live-confirmed (paid but not flown) must revert too
+    live_confirmed = json.dumps({"ref": LOCATOR, "duffel_order_id": ORDER_ID, "passenger_id": PAS_ID, "itinerary_json": ITIN_JSON, "offerId": OFFER_ID, "route": "JFK-LHR", "status": "confirmed", "source": "duffel-live"})
+    direct_vm.mock_web(rf"{FEED}/provider-status\?ref={LOCATOR}.*", {"status": 200, "body": live_confirmed})
+    direct_vm.mock_llm(r".*", live_confirmed)
+    with pytest.raises(Exception, match="completion evidence"):
+        agent.confirm_completion(bid)
+
+
+def test_settle_unheld_booking_reverts(direct_vm, agent, direct_alice, direct_owner):
+    """Settle on held (never confirmed) or unknown booking must revert."""
+    agent.set_provider(direct_owner)
+    bid = _hold(direct_vm, agent, direct_alice)
+    body = _completion_body("completed", "duffel-live")
+    direct_vm.mock_web(rf"{FEED}/provider-status\?ref={LOCATOR}.*", {"status": 200, "body": body})
+    direct_vm.mock_llm(r".*", body)
+    with pytest.raises(Exception, match="not settleable"):
+        agent.confirm_completion(bid)
+    with pytest.raises(Exception, match="unknown booking"):
+        agent.confirm_completion("NOPE-UNKNOWN-ID")
+
+
 def test_cancel_hold_unwinds_and_expired_confirm_reverts(direct_vm, agent, direct_alice):
     bid = _hold(direct_vm, agent, direct_alice)
     # cancel before expiry must revert

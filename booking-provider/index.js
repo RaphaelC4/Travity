@@ -1,18 +1,18 @@
 import "dotenv/config";
-import crypto from "node:crypto";
 import express from "express";
 import rateLimit from "express-rate-limit";
 
 const PORT = Number(process.env.PORT || 3001);
-const SECRET = String(process.env.BOOKING_PROVIDER_SECRET || process.env.PNR_SECRET || "booking-provider-dev-secret").trim();
-const ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+// Shared secret with travity-server (BOOKING_PROVIDER_API_KEY). When set,
+// every booking endpoint requires Authorization: Bearer <key>. Unset = local dev only.
+const PROVIDER_API_KEY = String(process.env.BOOKING_PROVIDER_API_KEY || process.env.PROVIDER_API_KEY || "").trim();
 
-function pnrFor(from, to, departIso, retIso) {
-  const key = `${from.toUpperCase()}|${to.toUpperCase()}|${departIso}|${retIso}`;
-  const d = crypto.createHmac("sha256", SECRET).update(key).digest();
-  let pnr = "";
-  for (let i = 0; i < 6; i++) pnr += ALPHABET[d[i] % ALPHABET.length];
-  return pnr;
+function requireProviderAuth(req, res, next) {
+  if (!PROVIDER_API_KEY) return next();
+  const auth = String(req.headers.authorization || "");
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  if (token !== PROVIDER_API_KEY) return res.status(401).json({ error: "unauthorized" });
+  return next();
 }
 
 function toIso(yyyymmdd) {
@@ -55,7 +55,11 @@ function refundPolicyFrom(conditions) {
   };
 }
 
-app.post("/book", limiter, async (req, res) => {
+app.post("/book", limiter, (req, res) => {
+  return res.status(410).json({ error: "gone: use POST /offer-hold then hold_booking, then POST /confirm" });
+});
+
+app.post("/book-legacy", limiter, async (req, res) => {
   const from = String(req.body?.from ?? req.body?.origin ?? "").trim().toUpperCase();
   const to = String(req.body?.to ?? req.body?.destination ?? "").trim().toUpperCase();
   const departRaw = String(req.body?.depart ?? "").trim();
@@ -167,7 +171,7 @@ app.post("/book", limiter, async (req, res) => {
 });
 
 // Offer hold — free, no Duffel charge. Returns off_… for hold_booking.
-app.post("/offer-hold", limiter, async (req, res) => {
+app.post("/offer-hold", limiter, requireProviderAuth, async (req, res) => {
   const from = String(req.body?.from ?? "").trim().toUpperCase();
   const to = String(req.body?.to ?? "").trim().toUpperCase();
   const departRaw = String(req.body?.depart ?? "").trim();
@@ -224,12 +228,13 @@ app.post("/offer-hold", limiter, async (req, res) => {
 });
 
 // Confirm — creates real Duffel order after escrow. Caller must have held offer.
-app.post("/confirm", limiter, async (req, res) => {
+app.post("/confirm", limiter, requireProviderAuth, async (req, res) => {
   const offerId = String(req.body?.offerId ?? req.body?.offer_id ?? "").trim();
   const pasId = String(req.body?.passengerId ?? req.body?.passenger_id ?? "").trim();
   const totalAmount = String(req.body?.totalAmount ?? req.body?.total_amount ?? "").trim();
   const totalCurrency = String(req.body?.totalCurrency ?? req.body?.total_currency ?? "USD").trim() || "USD";
   if (!offerId.startsWith("off_")) return res.status(400).json({ error: "offerId required" });
+  if (!pasId.startsWith("pas_")) return res.status(400).json({ error: "passengerId must be a Duffel pas_… from offer-hold" });
   if (!totalAmount) return res.status(400).json({ error: "totalAmount required (from offer-hold)" });
   const duffelKey = String(process.env.DUFFEL_API_KEY || "").trim();
   if (!duffelKey) return res.status(503).json({ error: "booking provider not configured: DUFFEL_API_KEY missing" });
@@ -237,7 +242,8 @@ app.post("/confirm", limiter, async (req, res) => {
     const orderRes = await fetch("https://api.duffel.com/air/orders", {
       method: "POST",
       headers: { Authorization: `Bearer ${duffelKey}`, "Duffel-Version": "v2", "Content-Type": "application/json" },
-      body: JSON.stringify({ data: { type: "instant", selected_offers: [offerId], passengers: [{ id: pasId || "pas_00000000000000", given_name: "John", family_name: "Doe", born_on: "1990-01-01", gender: "m", title: "mr", email: "john.doe@example.com", phone_number: "+14155551234" }], payments: [{ type: "balance", amount: totalAmount, currency: totalCurrency }] } }),
+      // Test-mode PII placeholder: replace with real passenger details for live settlement.
+      body: JSON.stringify({ data: { type: "instant", selected_offers: [offerId], passengers: [{ id: pasId, given_name: "John", family_name: "Doe", born_on: "1990-01-01", gender: "m", title: "mr", email: "john.doe@example.com", phone_number: "+14155551234" }], payments: [{ type: "balance", amount: totalAmount, currency: totalCurrency }] } }),
     });
     if (!orderRes.ok) {
       const txt = await orderRes.text().catch(() => "");
@@ -256,7 +262,7 @@ app.post("/confirm", limiter, async (req, res) => {
 // cached locally. This is what the dispute path calls through
 // travity-server's /provider-status so the evidence a validator sees is a
 // fresh carrier-side lookup, not project-controlled state.
-app.get("/order-status", limiter, async (req, res) => {
+app.get("/order-status", limiter, requireProviderAuth, async (req, res) => {
   const orderId = String(req.query.orderId || "").trim();
   const duffelKey = String(process.env.DUFFEL_API_KEY || "").trim();
   if (!orderId || !duffelKey) {
@@ -269,9 +275,25 @@ app.get("/order-status", limiter, async (req, res) => {
     if (!orderRes.ok) return res.status(502).json({ error: `Duffel lookup ${orderRes.status}` });
     const j = await orderRes.json();
     const cancelled = Boolean(j.data?.cancelled_at);
+    // Actual carrier completion: all ticketed segments arrived in the past.
+    // A merely confirmed (paid, future) order stays "confirmed" — elapsed
+    // date alone never promotes to completed here.
+    let completed = false;
+    try {
+      const segs = [];
+      for (const sl of (j.data?.slices ?? [])) {
+        for (const sg of (sl?.segments ?? [])) segs.push(sg);
+      }
+      if (segs.length > 0) {
+        completed = segs.every((sg) => {
+          const arr = Date.parse(String(sg?.arriving_at ?? ""));
+          return Number.isFinite(arr) && arr < Date.now();
+        });
+      }
+    } catch { completed = false; }
     return res.json({
       duffelOrderId: orderId,
-      status: cancelled ? "cancelled" : "confirmed",
+      status: cancelled ? "cancelled" : completed ? "completed" : "confirmed",
       refundPolicy: refundPolicyFrom(j.data?.conditions),
       source: "duffel-live",
     });

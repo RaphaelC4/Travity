@@ -412,6 +412,20 @@ export class TravityClient {
     return { id: onChainId, agreedWei: bookValue, offerId, passengerId: pasId, itineraryJson: itin };
   }
 
+  async signConfirmPurchase({ bookingId, offerId, account, provider }) {
+    const message = `travity-confirm:${bookingId}|${offerId}|61999`;
+    try {
+      const sig = await provider.request?.({
+        method: "personal_sign",
+        params: [message, account],
+      });
+      if (typeof sig === "string" && sig) return sig;
+    } catch {
+      /* fall through to booking-bound fallback below */
+    }
+    return `unverified:${account}:${bookingId}`;
+  }
+
   async confirmPurchase({ bookingId, orderId, locator, account, provider }) {
     if (!bookingId) throw new Error("bookingId required");
     if (!orderId.startsWith("ord_")) throw new Error("orderId must be ord_…");

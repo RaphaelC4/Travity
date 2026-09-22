@@ -13,7 +13,7 @@ services:
     envVars:
       - key: PORT
         value: 3001
-      - key: BOOKING_PROVIDER_SECRET
+      - key: BOOKING_PROVIDER_API_KEY
         sync: false
       - key: DUFFEL_API_KEY
         sync: false
@@ -41,21 +41,19 @@ services:
         value: "1800000"
       - key: QUOTE_PROXY_RATE_LIMIT
         value: "30"
-      # Server-only secret for HMAC refs when no external booking provider is
-      # configured — kept only as fallback so local dev/harness stay green.
+      # Operator credential for overrides + reaper. Required in production.
       - key: PNR_SECRET
         sync: false
-      # Actual provider transaction: the server POSTs the trip to this URL and
-      # stores the returned locator as the booking's reservation_ref. In
-      # production this points at travity-booking-provider; in local dev leave
-      # empty to use the HMAC fallback.
+      - key: OPERATOR_SECRET
+        sync: false
+      # Hold→confirm booking flow: /api/reserve calls /offer-hold (free),
+      # /api/confirm-purchase calls /confirm (paid). Required in production.
       - key: BOOKING_PROVIDER_URL
         value: https://travity-booking-provider.onrender.com/book
       - key: BOOKING_PROVIDER_API_KEY
         sync: false
-      # Independent carrier-status source for refund evidence (Aviationstack).
-      # When set, /provider-status enriches the HMAC/date-derived status with
-      # flight_status from an unaffiliated API.
+      # Independent carrier-status source for completion/refund evidence.
+      # Required in production: settlement rejects date-rule alone.
       - key: AVIATIONSTACK_KEY
         sync: false
 

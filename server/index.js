@@ -9,13 +9,13 @@
  *   (OmkarCloud Expedia Scraper). No fallback chain, no demo feed.
  * - GET /quote          : plain-JSON alias a GenLayer contract leader can
  *   fetch from `quote_feed`. Same handler, no date param defaults.
- * - POST /api/reserve   : issues a deterministic reservation (PNR) before
- *   escrow. The on-chain book() stores this ref; it is the anchor dispute
- *   escalation verifies against /status evidence.
- * - GET /status         : dispute evidence for the contract's escalate
- *   consensus block. Stateless and unauthenticated by design: the ref is an
- *   HMAC of the trip parameters over the server-only PNR_SECRET, so a valid
- *   ref proves issuance without any shared secret; tampered/unknown refs 404.
+ * - POST /api/reserve   : holds a Duffel offer (no charge) before escrow.
+ *   The on-chain hold_booking() locks escrow; confirm_purchase seals the
+ *   Duffel order receipt. Unknown refs 404.
+ * - POST /api/confirm-purchase : creates the Duffel order AFTER escrow.
+ *   Dual-auth (wallet signature or operator token), idempotent per offer.
+ * - GET /status         : legacy date-rule evidence (dispute path uses
+ *   GET /provider-status with duffel-live/aviationstack instead).
  *
  * NO MOCK: with no configured provider it returns 503 rather than fabricating
  * a price. Without a usable GEN price (GEN_USD_RATE or CoinGecko) it returns
@@ -86,9 +86,8 @@ if (!PNR_SECRET) {
 }
 // Generic booking-provider + independent carrier-status source.
 // BOOKING_PROVIDER_URL + AVIATIONSTACK_KEY enable binding to an actual
-// provider transaction; OPERATOR_SECRET gates the override endpoint. When any
-// of these are unset the server falls back gracefully (HMAC refs, date-rule
-// status) so local dev and GLSim tests still work without credentials.
+// provider transaction; OPERATOR_SECRET gates the override + reaper endpoints.
+// BOOKING_PROVIDER_URL is required in production (no HMAC issuance fallback).
 const BOOKING_PROVIDER_URL = String(process.env.BOOKING_PROVIDER_URL || "").trim();
 const BOOKING_PROVIDER_API_KEY = String(process.env.BOOKING_PROVIDER_API_KEY || "").trim();
 const AVIATIONSTACK_KEY = String(process.env.AVIATIONSTACK_KEY || "").trim();
@@ -985,20 +984,59 @@ app.post("/api/confirm-purchase", reserveLimiter, async (req, res) => {
   const offerId = String(req.body?.offerId || req.body?.offer_id || "").trim();
   const passengerId = String(req.body?.passengerId || req.body?.passenger_id || "").trim();
   if (!bookingId || !offerId) return res.status(400).json({ error: "bookingId and offerId required" });
+  // Dual auth: operator token OR customer wallet identity (signature verified on-chain at confirm_purchase).
+  const auth = String(req.headers.authorization || "");
+  const bearer = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  const walletAddr = String(req.headers["x-wallet-address"] || "").trim();
+  const walletSig = String(req.headers["x-wallet-signature"] || "").trim();
+  const isOperator = Boolean(OPERATOR_SECRET) && bearer === OPERATOR_SECRET;
+  const isCustomer = Boolean(walletAddr) && Boolean(walletSig);
+  if (!isOperator && !isCustomer) {
+    return res.status(401).json({ error: "unauthorized: operator token or wallet signature required" });
+  }
   try {
+    // Bind caller to held booking: bookingId is key+"-"+sender, so it must end with the wallet address.
+    // Operator cron path skips this (it reconciles, never spends without a prior hold).
+    if (isCustomer && !isOperator) {
+      const bidLower = bookingId.toLowerCase();
+      const wLower = walletAddr.toLowerCase();
+      if (!bidLower.endsWith(wLower)) {
+        return res.status(403).json({ error: "wallet address does not match booking customer" });
+      }
+    }
     // Look up hold to get exact Duffel total for payment (must match offer total)
     let holdRec = null;
-    for (const [, v] of cache.reservations.entries()) {
-      if (v.offerId === offerId) { holdRec = v; break; }
+    let holdKey = null;
+    for (const [k, v] of cache.reservations.entries()) {
+      if (v.offerId === offerId) { holdRec = v; holdKey = k; break; }
+    }
+    if (!holdRec) return res.status(404).json({ error: "unknown offer hold" });
+    // Hold must belong to this booking's route; bookingId starts with the route key.
+    if (holdRec.route && !bookingId.toUpperCase().startsWith(String(holdRec.route).toUpperCase())) {
+      return res.status(409).json({ error: "offer does not belong to this booking" });
+    }
+    if (passengerId && holdRec.passenger_id && passengerId !== holdRec.passenger_id) {
+      return res.status(409).json({ error: "passenger does not match held offer" });
+    }
+    // Idempotent: already confirmed returns cached receipt without a new Duffel charge.
+    if (holdRec.providerOrderId && holdRec.status === "confirmed") {
+      // First confirmer wins: a different bookingId claiming the same offer is a conflict.
+      if (holdRec.bookingId && holdRec.bookingId !== bookingId) {
+        return res.status(409).json({ error: "offer already confirmed for another booking" });
+      }
+      return res.json({ locator: holdRec.ref, duffelOrderId: holdRec.providerOrderId, refundPolicy: holdRec.refundPolicy ?? null, cached: true });
+    }
+    // Pin this bookingId to the hold so a second booking cannot steal the offer mid-flight.
+    if (!holdRec.bookingId) {
+      holdRec.bookingId = bookingId;
+      saveReservations();
+    } else if (holdRec.bookingId !== bookingId) {
+      return res.status(409).json({ error: "offer held for another booking" });
     }
     const order = await createOrderViaProvider(offerId, passengerId, holdRec?.totalAmount, holdRec?.totalCurrency);
     if (!order) return res.status(502).json({ error: "Duffel purchase failed" });
     // update cached hold with real order
     // find hold by offerId
-    let holdKey = null;
-    for (const [k, v] of cache.reservations.entries()) {
-      if (v.offerId === offerId) { holdKey = k; break; }
-    }
     if (holdKey) {
       const rec = cache.reservations.get(holdKey);
       rec.providerOrderId = order.duffelOrderId;
@@ -1056,9 +1094,16 @@ app.get("/provider-status", async (req, res) => {
   // conditions, not just a confirmed/completed/cancelled flag.
   const live = await liveOrderStatus(binding.providerOrderId);
   if (live && live.source === "duffel-live") {
-    derived = live.status === "cancelled" ? "cancelled" : derived;
+    // Never promote a date-derived completed to duffel-live: only the live
+    // lookup's own completed/cancelled counts as carrier evidence.
+    if (live.status === "cancelled") {
+      derived = "cancelled";
+      source = "duffel-live";
+    } else if (live.status === "completed") {
+      derived = "completed";
+      source = "duffel-live";
+    }
     refundPolicy = live.refundPolicy ?? refundPolicy;
-    source = "duffel-live";
   }
 
   // Secondary, unaffiliated flight-status enrichment (does not gate the
@@ -1070,8 +1115,11 @@ app.get("/provider-status", async (req, res) => {
     const av = await fetchAviationStatus(flightIata, flightDate);
     if (av) {
       aviation = { flight_status: av.flight_status, departure: av.departure, arrival: av.arrival };
-      if (source !== "duffel-live" &&
-        (av.flight_status === "cancelled" || av.flight_status === "diverted" || av.flight_status === "incident")) {
+      const fs = String(av.flight_status || "").toLowerCase();
+      if (fs === "landed" || fs === "arrived") {
+        derived = "completed";
+        source = "aviationstack";
+      } else if (fs === "cancelled" || fs === "diverted" || fs === "incident") {
         derived = "cancelled";
         source = "aviationstack";
       }

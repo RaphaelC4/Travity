@@ -54,30 +54,26 @@ an oversight:
 These three are enforced together, not independently, because a gap in any
 one defeats the others:
 
-1. **Real carrier/agency transaction, not a project-issued reference.**
-   `book()` requires a `reservation_ref` — the booking reference the
-   *carrier/agency* issued when the reservation was actually created
-   off-chain. `booking-provider/` transacts with Duffel (an IATA-accredited
-   aggregator): `POST /book` creates a real Duffel order and returns its
-   `booking_reference`. There is no silent fallback to a project-generated
-   reference — without `DUFFEL_API_KEY` the service refuses the booking
-   (503) rather than mint an HMAC placeholder; the only way to opt into
-   the HMAC fixture is `ALLOW_HMAC_DEV_FALLBACK=true`, which is never set
-   in `render.yaml`/`railway.json`, so nothing deployed can produce one.
-   The dispute path fetches `/provider-status?ref&from&to&depart&ret` from
-   `travity-server`, which re-verifies the order **live against Duffel**
-   (`GET /order-status`, keyed off the stored `duffelOrderId`) rather than
-   trusting its own cached copy — an independently re-checkable receipt,
-   not project-controlled state. That response also carries the fare's own
-   refund/cancellation policy (`refund_policy`: refundable/non_refundable +
-   penalty), pulled from the same live Duffel lookup, so the dispute ruling
-   is grounded in the fare's actual terms instead of an unconstrained
-   guess. Evidence that doesn't echo the booking's own ref, or that can't
-   be reached at all, is treated as unavailable (full-refund default).
-   Settlement is fully deterministic and needs no external input:
-   `settle_booking` (permissionless) pays out once the return date has passed,
-   and `force_complete` (owner-only) settles early as an explicit operator
-   override.
+1. **Real carrier/agency transaction, escrow before purchase.**
+   `hold_booking` (7-arg, payable) locks escrow with `status:"held"` and
+   `hold_expiry=now+900` — no Duffel charge, no `reservation_ref` yet.
+   `POST /offer-hold` is free; `POST /confirm` (`selected_offers:[off_…]`,
+   exact `totalAmount`) runs only after `hold_booking` is `FINALIZED`
+   (`POST /api/confirm-purchase`), then `confirm_purchase` (customer-only)
+   seals `ord_…`/`locator` with `order_used`/`ref_used` uniqueness.
+   There is no silent fallback — without `DUFFEL_API_KEY` the provider
+   returns `503`; `POST /book` is `410 Gone`. `POST /api/confirm-purchase`
+   requires operator bearer or wallet identity, binds `bookingId→offerId`,
+   and is idempotent (returns cached receipt, never double-charges).
+   Completion requires **live carrier evidence**: `provider-status`
+   `source` must be `duffel-live` (`completed` derived from flown
+   segments) or `aviationstack` (`landed`/`arrived`) — `date-rule`
+   `completed` alone reverts, and date inference is never relabeled
+   `duffel-live`. The dispute path carries the fare's own
+   `refund_policy` from the same live lookup. Evidence that doesn't echo
+   the booking's own ref/order/passenger/itinerary, or that can't be
+   reached at all, is treated as unavailable (full-refund default in
+   disputes, revert in settlement).
 2. **Customer-only dispute authorization.** `file_dispute` checks
    `gl.message.sender_address` against `booking["customer"]` before accepting
    a claim — only the person who escrowed the funds for a booking can dispute
