@@ -140,20 +140,59 @@ const isValidRef = (ref) =>
 
 /** Holds a Duffel offer (no charge) — returns offer tuple for hold_booking.
  * Purchase happens only after escrow via /api/confirm-purchase. */
+async function serverBase() {
+  return (import.meta.env.VITE_QUOTE_API || "").replace(/\/+$/, "");
+}
+
+/** Pre-flight: is the quote server reachable at all? Distinguishes
+ * network-down (ERR_FAILED/TypeError) from API errors (4xx/5xx with body). */
+async function checkServerReachable() {
+  const base = await serverBase();
+  const url = `${base}/health`;
+  let res;
+  try {
+    res = await fetch(url, { headers: { Accept: "application/json" } });
+  } catch (e) {
+    const err = new Error(
+      `Quote server unreachable at ${url || "/health"} — ` +
+      (base
+        ? "the deployed server may be asleep (Render free tier wakes in ~30s, retry once) or redeploying."
+        : "local dev: start it with `cd server && npm run dev` (Vite proxies /api → 127.0.0.1:8080).")
+    );
+    err.status = 0;
+    err.code = "SERVER_UNREACHABLE";
+    throw err;
+  }
+  return res;
+}
+
 async function createReservation({ origin, destination, depart, ret, passenger, itineraryJson }) {
-  const base = (import.meta.env.VITE_QUOTE_API || "").replace(/\/+$/, "");
-  const res = await fetch(`${base}/api/reserve`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({
-      from: String(origin).toUpperCase(),
-      to: String(destination).toUpperCase(),
-      depart: String(depart),
-      ret: String(ret),
-      passenger: passenger ?? null,
-      itinerary_json: itineraryJson ?? null,
-    }),
-  });
+  const base = await serverBase();
+  let res;
+  try {
+    res = await fetch(`${base}/api/reserve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        from: String(origin).toUpperCase(),
+        to: String(destination).toUpperCase(),
+        depart: String(depart),
+        ret: String(ret),
+        passenger: passenger ?? null,
+        itinerary_json: itineraryJson ?? null,
+      }),
+    });
+  } catch (e) {
+    await checkServerReachable().catch(() => {});
+    const err = new Error(
+      `Quote server unreachable — network failed before a response ` +
+      (base ? `(tried ${base}/api/reserve; server may be asleep, retry in ~30s).` : `(tried relative /api/reserve; local dev: is \`cd server && npm run dev\` running?).`)
+    );
+    err.status = 0;
+    err.code = "SERVER_UNREACHABLE";
+    err.cause = e;
+    throw err;
+  }
   const j = await res.json().catch(() => ({}));
   if (!res.ok) {
     const err = new Error(j.error || `Reservation failed (${res.status})`);

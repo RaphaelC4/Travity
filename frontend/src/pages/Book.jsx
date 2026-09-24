@@ -124,7 +124,19 @@ export default function Book() {
     setBusy(true);
     try {
       // Two-step: 1) hold offer (no Duffel charge), 2) escrow on-chain, 3) purchase Duffel, 4) seal receipt
-      // Duffel throttles offer_requests per key — honor Retry-After with backoff instead of hammering.
+      // Pre-flight first: a quote restored from localStorage can look live while the server is down.
+      try {
+        const base = (import.meta.env.VITE_QUOTE_API || "").replace(/\/+$/, "");
+        await fetch(`${base}/health`, { headers: { Accept: "application/json" } });
+      } catch {
+        throw Object.assign(
+          new Error(
+            "Quote server unreachable — the price shown may be a cached quote. " +
+            "Start the server (`cd server && npm run dev`) or wait ~30s for the Render free tier to wake, then Get quote again before booking."
+          ),
+          { code: "SERVER_UNREACHABLE", status: 0 }
+        );
+      }
       let hold;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
@@ -183,7 +195,12 @@ export default function Book() {
       setQuote(null);
       showToast(`Trip booked (PNR ${sealedRef}): fare escrowed at the on-chain agreed price (network gas was charged separately).`, "status");
     } catch (err) {
-      showToast("Booking failed: " + (err.message || "unknown error"), "alert");
+      showToast(
+        err.code === "SERVER_UNREACHABLE" || err.status === 0
+          ? "Booking failed: server unreachable. " + (err.message || "")
+          : "Booking failed: " + (err.message || "unknown error"),
+        "alert"
+      );
     } finally {
       setBusy(false);
     }
