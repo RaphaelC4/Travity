@@ -155,7 +155,12 @@ async function createReservation({ origin, destination, depart, ret, passenger, 
     }),
   });
   const j = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(j.error || `Reservation failed (${res.status})`);
+  if (!res.ok) {
+    const err = new Error(j.error || `Reservation failed (${res.status})`);
+    err.status = res.status;
+    err.retryAfter = j.retryAfter || res.headers.get("retry-after") || undefined;
+    throw err;
+  }
   return {
     ref: String(j.ref || "").toUpperCase(),
     offerId: String(j.offerId || j.offer_id || ""),

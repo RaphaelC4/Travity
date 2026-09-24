@@ -225,7 +225,10 @@ async function createHoldViaProvider(from, to, departIso) {
   const j = await res.json().catch(() => ({}));
   if (!res.ok) {
     console.error("[quote-server] offer-hold failed:", res.status, j.error || "");
-    throw new Error(j.error || `offer-hold failed (${res.status})`);
+    const err = new Error(j.error || `offer-hold failed (${res.status})`);
+    err.status = res.status;
+    err.retryAfter = j.retryAfter || res.headers.get("retry-after") || undefined;
+    throw err;
   }
   if (!j.offerId) throw new Error("offer-hold returned no offerId");
   return { offerId: j.offerId, passengerId: j.passengerId, itineraryJson: j.itinerary_json, expiresAt: j.expiresAt, totalAmount: j.totalAmount, totalCurrency: j.totalCurrency };
@@ -928,8 +931,10 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
     try {
       offerHold = await createHoldViaProvider(f, t, d);
     } catch (e) {
-      const is429 = /429/.test(e.message);
-      return res.status(is429 ? 429 : 502).json({ error: `booking provider failed to hold offer: ${e.message}`, retryAfter: is429 ? 3 : undefined });
+      const is429 = e.status === 429 || /429/.test(e.message || "");
+      const ra = String(e.retryAfter || "30");
+      if (is429) res.set("Retry-After", ra);
+      return res.status(is429 ? 429 : 502).json({ error: `booking provider failed to hold offer: ${e.message}`, retryAfter: is429 ? ra : undefined });
     }
     var offerId = offerHold.offerId;
     var passengerId = offerHold.passengerId;

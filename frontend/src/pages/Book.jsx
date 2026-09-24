@@ -124,8 +124,9 @@ export default function Book() {
     setBusy(true);
     try {
       // Two-step: 1) hold offer (no Duffel charge), 2) escrow on-chain, 3) purchase Duffel, 4) seal receipt
+      // Duffel throttles offer_requests per key — honor Retry-After with backoff instead of hammering.
       let hold;
-      for (let attempt = 0; attempt < 2; attempt++) {
+      for (let attempt = 0; attempt < 3; attempt++) {
         try {
           hold = await client.createReservation({
             origin: form.origin, destination: form.destination,
@@ -133,9 +134,11 @@ export default function Book() {
           });
           break;
         } catch (e) {
-          if (/429/.test(e.message) && attempt === 0) {
-            showToast("Duffel is busy (429) — retrying in 3s…", "status");
-            await new Promise((r) => setTimeout(r, 3000));
+          const is429 = e.status === 429 || /429/.test(e.message || "");
+          if (is429 && attempt < 2) {
+            const waitS = Math.max(3, Math.min(60, parseInt(e.retryAfter, 10) || 5));
+            showToast(`Duffel is busy (429) — retrying in ${waitS}s… (attempt ${attempt + 2}/3)`, "status");
+            await new Promise((r) => setTimeout(r, waitS * 1000));
             continue;
           }
           throw e;

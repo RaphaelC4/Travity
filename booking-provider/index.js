@@ -41,6 +41,9 @@ const limiter = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: true, 
 const _offerCache = new Map();
 const OFFER_TTL_MS = 300_000;
 const _offer429Cache = new Map();
+const NEG_TTL_MS = 60_000;
+// Single-flight: concurrent holds for the same route/date share one Duffel call.
+const _offerInflight = new Map();
 
 // Turn a Duffel order's `conditions` block into a plain refund-policy summary
 // the dispute LLM can weigh directly, instead of raw nested JSON it would
@@ -182,14 +185,27 @@ app.post("/offer-hold", limiter, requireProviderAuth, async (req, res) => {
   if (!duffelKey) return res.status(503).json({ error: "booking provider not configured: DUFFEL_API_KEY missing" });
   const cacheKey = `${from}|${to}|${departIso}`;
   const neg = _offer429Cache.get(cacheKey);
-  if (neg && Date.now() - neg.ts < 10000) {
-    return res.status(429).json({ error: "Duffel rate limited (429), please retry in a few seconds", retryAfter: "3" });
+  if (neg && Date.now() - neg.ts < NEG_TTL_MS) {
+    const waitS = Math.max(1, Math.ceil((NEG_TTL_MS - (Date.now() - neg.ts)) / 1000));
+    res.set("Retry-After", String(waitS));
+    return res.status(429).json({ error: "Duffel rate limited (429), please retry shortly", retryAfter: String(waitS) });
   }
   const cached = _offerCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < OFFER_TTL_MS) {
     return res.json(cached.value);
   }
-  try {
+  // Single-flight: join an in-progress Duffel call for the same key instead of firing another.
+  const inflight = _offerInflight.get(cacheKey);
+  if (inflight) {
+    try {
+      const value = await inflight;
+      return res.json(value);
+    } catch (e) {
+      const is429 = /429/.test(e.message || "");
+      return res.status(is429 ? 429 : 502).json({ error: `offer-hold failed: ${e.message}`, retryAfter: is429 ? "30" : undefined });
+    }
+  }
+  const task = (async () => {
     const doFetch = async () => fetch("https://api.duffel.com/air/offer_requests", {
       method: "POST",
       headers: { Authorization: `Bearer ${duffelKey}`, "Duffel-Version": "v2", "Content-Type": "application/json" },
@@ -197,17 +213,14 @@ app.post("/offer-hold", limiter, requireProviderAuth, async (req, res) => {
     });
     let offerReq = await doFetch();
     if (offerReq.status === 429) {
-      const retryAfter = offerReq.headers.get("retry-after") || "3";
-      const waitMs = Math.max(2000, Math.min(10000, parseInt(retryAfter, 10) * 1000 || 2000));
-      console.warn(`[booking-provider] Duffel 429, retry-after=${retryAfter}, waiting ${waitMs}ms`);
+      // Honor Duffel's own backoff, then fail fast with 429 so callers back off —
+      // holding the connection open on repeated retries burns quota faster.
+      const retryAfter = offerReq.headers.get("retry-after") || "30";
+      console.warn(`[booking-provider] Duffel 429, retry-after=${retryAfter} for ${cacheKey}`);
       _offer429Cache.set(cacheKey, { ts: Date.now() });
-      await new Promise((r) => setTimeout(r, waitMs));
-      offerReq = await doFetch();
-      if (offerReq.status === 429) {
-        const ra2 = offerReq.headers.get("retry-after") || retryAfter || "3";
-        res.set("Retry-After", ra2);
-        return res.status(429).json({ error: "Duffel rate limited (429), please retry in a few seconds", retryAfter: ra2 });
-      }
+      const err = new Error(`Duffel offer_requests 429 (retry after ${retryAfter}s)`);
+      err.retryAfter = retryAfter;
+      throw err;
     }
     if (!offerReq.ok) throw new Error(`Duffel offer_requests ${offerReq.status}`);
     const offerJson = await offerReq.json();
@@ -218,12 +231,23 @@ app.post("/offer-hold", limiter, requireProviderAuth, async (req, res) => {
     const value = { offerId: offer.id, passengerId, itinerary_json: itineraryJson, expiresAt: offer.expires_at ?? null, totalAmount: offer.total_amount, totalCurrency: offer.total_currency };
     _offerCache.set(cacheKey, { ts: Date.now(), value });
     _offer429Cache.delete(cacheKey);
+    return value;
+  })();
+  _offerInflight.set(cacheKey, task);
+  try {
+    const value = await task;
     return res.json(value);
   } catch (e) {
     console.error("[booking-provider] offer-hold failed:", e.message);
-    const is429 = /429/.test(e.message);
-    if (is429) _offer429Cache.set(cacheKey, { ts: Date.now() });
-    return res.status(is429 ? 429 : 502).json({ error: `offer-hold failed: ${e.message}`, retryAfter: is429 ? "3" : undefined });
+    const is429 = /429/.test(e.message || "");
+    const ra = (e.retryAfter || "30").toString();
+    if (is429) {
+      _offer429Cache.set(cacheKey, { ts: Date.now() });
+      res.set("Retry-After", ra);
+    }
+    return res.status(is429 ? 429 : 502).json({ error: `offer-hold failed: ${e.message}`, retryAfter: is429 ? ra : undefined });
+  } finally {
+    _offerInflight.delete(cacheKey);
   }
 });
 
