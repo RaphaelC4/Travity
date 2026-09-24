@@ -281,6 +281,31 @@ app.post("/confirm", limiter, requireProviderAuth, async (req, res) => {
   }
 });
 
+// Cancel a Duffel order (reaper path for orphan paid orders never sealed
+// on-chain). Best-effort: test-mode cancellations refund balance automatically;
+// live non-refundable fares may still charge — the response always says how.
+app.post("/cancel", limiter, requireProviderAuth, async (req, res) => {
+  const orderId = String(req.body?.orderId ?? req.body?.order_id ?? "").trim();
+  if (!orderId.startsWith("ord_")) return res.status(400).json({ error: "orderId must be a Duffel ord_…" });
+  const duffelKey = String(process.env.DUFFEL_API_KEY || "").trim();
+  if (!duffelKey) return res.status(503).json({ error: "booking provider not configured: DUFFEL_API_KEY missing" });
+  try {
+    const cancelRes = await fetch("https://api.duffel.com/air/order_cancellations", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${duffelKey}`, "Duffel-Version": "v2", "Content-Type": "application/json" },
+      body: JSON.stringify({ data: { order_id: orderId } }),
+    });
+    const j = await cancelRes.json().catch(() => ({}));
+    if (!cancelRes.ok) {
+      const txt = typeof j === "object" ? JSON.stringify(j).slice(0, 200) : String(j).slice(0, 200);
+      return res.status(502).json({ error: `Duffel cancel failed (${cancelRes.status}): ${txt}` });
+    }
+    return res.json({ orderId, cancelled: true, refund: j.data?.refund_amount ?? j.data?.refund_to ?? null });
+  } catch (e) {
+    return res.status(502).json({ error: `cancel failed: ${e.message}` });
+  }
+});
+
 // Live, independent re-verification: re-fetches the order directly from
 // Duffel at dispute time instead of trusting whatever this server has
 // cached locally. This is what the dispute path calls through

@@ -1048,6 +1048,7 @@ app.post("/api/confirm-purchase", reserveLimiter, async (req, res) => {
       rec.ref = order.locator;
       rec.refundPolicy = order.refundPolicy;
       rec.status = "confirmed";
+      rec.orderCreatedAt = Date.now();
       rec.updatedAt = Date.now();
       // re-key under real locator as well
       cache.reservations.set(order.locator, { ...rec, ref: order.locator });
@@ -1158,6 +1159,63 @@ const statusLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   handler: (_req, res) => res.status(429).json({ error: "Too many status updates. Try again shortly." }),
+});
+
+// Reaper for expired holds: lists holds past holdExpiry with no Duffel order
+// (caller must run cancel_hold on-chain to refund escrow), plus orphan paid
+// orders never sealed via confirm_purchase. Operator-only. With
+// {"execute": true} it best-effort cancels orphan Duffel orders via the
+// provider so test-mode balance isn't left holding unlinked tickets.
+// Intended caller: external scheduler every 5 min (Render cron needs a paid
+// plan, so use cron-job.org or similar against this endpoint).
+app.post("/api/reaper", statusLimiter, async (req, res) => {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  if (!OPERATOR_SECRET || token !== OPERATOR_SECRET) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const execute = req.body?.execute === true;
+  const now = Date.now();
+  const expired = [];
+  const orphans = [];
+  for (const [k, v] of cache.reservations.entries()) {
+    if (k !== v.ref) continue; // skip locator alias entries
+    // Expired hold, never purchased: on-chain cancel_hold refunds escrow.
+    if (!v.providerOrderId && (v.status === "offer_held" || v.status === "held")) {
+      const deadline = Number(v.createdAt || 0) + 900000; // 900s Duffel offer window
+      if (deadline && now > deadline) expired.push({ ref: k, offerId: v.offerId, bookingId: v.bookingId ?? null });
+    }
+    // Paid Duffel order whose on-chain confirm_purchase may never have landed:
+    // operator verifies view_booking, then confirms or cancels.
+    if (v.providerOrderId && v.orderCreatedAt && now - Number(v.orderCreatedAt) > 30 * 60 * 1000 && !v.reconciled) {
+      orphans.push({ ref: k, orderId: v.providerOrderId, bookingId: v.bookingId ?? null });
+    }
+  }
+  const cancelled = [];
+  if (execute) {
+    const base = String(BOOKING_PROVIDER_URL || "").trim().replace(/\/book\/?$/, "");
+    for (const o of orphans) {
+      try {
+        const r = await fetch(`${base}/cancel`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...(BOOKING_PROVIDER_API_KEY ? { Authorization: `Bearer ${BOOKING_PROVIDER_API_KEY}` } : {}) },
+          body: JSON.stringify({ orderId: o.orderId }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (r.ok) {
+          cancelled.push(o.orderId);
+          const rec = cache.reservations.get(o.ref);
+          if (rec) { rec.reconciled = true; rec.updatedAt = Date.now(); }
+        } else {
+          o.cancelError = j.error || `cancel failed (${r.status})`;
+        }
+      } catch (e) {
+        o.cancelError = e.message;
+      }
+    }
+    saveReservations();
+  }
+  return res.json({ expired, orphans, cancelled: execute ? cancelled : undefined });
 });
 
 app.post("/api/reservations/:ref/status", statusLimiter, (req, res) => {

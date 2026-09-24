@@ -7,12 +7,14 @@ services:
     runtime: node
     rootDir: booking-provider
     plan: free
-    buildCommand: npm install
+    buildCommand: npm ci
     startCommand: npm start
     healthCheckPath: /health
     envVars:
       - key: PORT
         value: 3001
+      # Must equal BOOKING_PROVIDER_API_KEY on travity-server (server sends it
+      # as Bearer on /offer-hold, /confirm, /order-status, /cancel).
       - key: BOOKING_PROVIDER_API_KEY
         sync: false
       - key: DUFFEL_API_KEY
@@ -90,3 +92,16 @@ services:
       - type: rewrite
         source: /*
         destination: /index.html
+
+# ---- Expired-hold reaper (NOT a Render cron: cron jobs need a paid plan) ----
+# Instead, point a free external scheduler (e.g. cron-job.org) at:
+#   POST https://travity-server.onrender.com/api/reaper {"execute": true}
+# with header  Authorization: Bearer <OPERATOR_SECRET>  every 5 minutes.
+# It lists expired holds (cancel_hold refunds escrow on-chain) and orphan paid
+# Duffel orders (POST booking-provider /cancel refunds test-mode balance).
+# cron:
+# - name: travity-reaper
+#   runtime: node
+#   schedule: "*/5 * * * *"
+#   buildCommand: npm ci
+#   startCommand: node scripts/reaper-ping.mjs
