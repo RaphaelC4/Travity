@@ -786,11 +786,13 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "16kb" }));
 
 // Browser clients on another origin (e.g. the deployed frontend / Vite dev)
-// must be allowed to call this API. GET-only, so a permissive CORS policy is fine.
+// must be allowed to call this API, including the wallet-identity headers
+// used by POST /api/confirm-purchase (X-Wallet-Address/X-Wallet-Signature)
+// and the operator Bearer token (Authorization).
 app.use((req, res, next) => {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.set("Access-Control-Allow-Headers", "Content-Type, Accept");
+  res.set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization, X-Wallet-Address, X-Wallet-Signature");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });

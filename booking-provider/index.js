@@ -27,10 +27,11 @@ const IATA_RE = /^[A-Za-z]{3}$/;
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "8kb" }));
-app.use((_, res, next) => {
+app.use((req, res, next) => {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization, X-Wallet-Address, X-Wallet-Signature");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
