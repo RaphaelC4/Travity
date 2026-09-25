@@ -78,12 +78,39 @@ app.use((req, res, next) => {
 
 app.get("/health", (_req, res) => res.json({ ok: true, service: "travity-booking-provider", duffelConfigured: Boolean(String(process.env.DUFFEL_API_KEY || "").trim()), providerKeyConfigured: Boolean(PROVIDER_API_KEY), commit: String(process.env.RENDER_GIT_COMMIT || "local").slice(0, 7) }));
 
-const limiter = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false });
+// Own per-IP rate limit. Custom JSON body (not the default text) so upstream
+// can tell OUR throttle apart from Duffel's: ours says "local rate limit".
+const limiter = rateLimit({
+  windowMs: 60_000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) => {
+    res.set("Retry-After", "10");
+    res.status(429).json({ error: "booking provider busy (local rate limit, not Duffel) — retry in a few seconds", retryAfter: "10" });
+  },
+});
 
 const _offerCache = new Map();
 const OFFER_TTL_MS = 300_000;
 const _offer429Cache = new Map();
+// Cooldown honors Duffel's own Retry-After header in full (cap 10 min), not a
+// fixed window: a short fixed window is what kept re-hammering Duffel mid-throttle.
+// NEG_TTL_MS is only the fallback when no header is present.
 const NEG_TTL_MS = 60_000;
+const NEG_TTL_MAX_MS = 600_000;
+
+function duffelRetryAfterMs(headerValue) {
+  const s = Math.round(Number(headerValue) || 0) * 1000;
+  if (!Number.isFinite(s) || s <= 0) return NEG_TTL_MS;
+  return Math.min(Math.max(s, NEG_TTL_MS), NEG_TTL_MAX_MS);
+}
+
+function armCooldown(cacheKey, retryAfterHeader) {
+  const until = Date.now() + duffelRetryAfterMs(retryAfterHeader);
+  _offer429Cache.set(cacheKey, { until });
+  return Math.max(1, Math.ceil((until - Date.now()) / 1000));
+}
 // Single-flight: concurrent holds for the same route/date share one Duffel call.
 const _offerInflight = new Map();
 
@@ -227,8 +254,8 @@ app.post("/offer-hold", limiter, requireProviderAuth, async (req, res) => {
   if (!duffelKey) return res.status(503).json({ error: "booking provider not configured: DUFFEL_API_KEY missing" });
   const cacheKey = `${from}|${to}|${departIso}`;
   const neg = _offer429Cache.get(cacheKey);
-  if (neg && Date.now() - neg.ts < NEG_TTL_MS) {
-    const waitS = Math.max(1, Math.ceil((NEG_TTL_MS - (Date.now() - neg.ts)) / 1000));
+  if (neg && Date.now() < neg.until) {
+    const waitS = Math.max(1, Math.ceil((neg.until - Date.now()) / 1000));
     res.set("Retry-After", String(waitS));
     return res.status(429).json({ error: "Duffel rate limited (429), please retry shortly", retryAfter: String(waitS) });
   }
@@ -244,7 +271,9 @@ app.post("/offer-hold", limiter, requireProviderAuth, async (req, res) => {
       return res.json(value);
     } catch (e) {
       const is429 = /429/.test(e.message || "");
-      return res.status(is429 ? 429 : 502).json({ error: `offer-hold failed: ${e.message}`, retryAfter: is429 ? "30" : undefined });
+      const ra = String(e.retryAfter || "60");
+      if (is429) res.set("Retry-After", ra);
+      return res.status(is429 ? 429 : 502).json({ error: `offer-hold failed: ${e.message}`, retryAfter: is429 ? ra : undefined });
     }
   }
   const task = (async () => {
@@ -255,13 +284,14 @@ app.post("/offer-hold", limiter, requireProviderAuth, async (req, res) => {
     });
     let offerReq = await doFetch();
     if (offerReq.status === 429) {
-      // Honor Duffel's own backoff, then fail fast with 429 so callers back off —
-      // holding the connection open on repeated retries burns quota faster.
-      const retryAfter = offerReq.headers.get("retry-after") || "30";
-      console.warn(`[booking-provider] Duffel 429, retry-after=${retryAfter} for ${cacheKey}`);
-      _offer429Cache.set(cacheKey, { ts: Date.now() });
-      const err = new Error(`Duffel offer_requests 429 (retry after ${retryAfter}s)`);
-      err.retryAfter = retryAfter;
+      // Fail fast with 429 so callers back off — holding the connection open
+      // on repeated retries burns quota faster. Cooldown honors Duffel's own
+      // Retry-After in full (armCooldown), so we stop calling for its window.
+      const retryAfter = offerReq.headers.get("retry-after") || "60";
+      const waitS = armCooldown(cacheKey, retryAfter);
+      console.warn(`[booking-provider] Duffel 429, retry-after=${retryAfter} for ${cacheKey}, cooling down ${waitS}s`);
+      const err = new Error(`Duffel offer_requests 429 (retry after ${waitS}s)`);
+      err.retryAfter = String(waitS);
       throw err;
     }
     if (!offerReq.ok) throw new Error(`Duffel offer_requests ${offerReq.status}`);
@@ -282,12 +312,13 @@ app.post("/offer-hold", limiter, requireProviderAuth, async (req, res) => {
   } catch (e) {
     console.error("[booking-provider] offer-hold failed:", e.message);
     const is429 = /429/.test(e.message || "");
-    const ra = (e.retryAfter || "30").toString();
+    const ra = String(e.retryAfter || "60");
     if (is429) {
-      _offer429Cache.set(cacheKey, { ts: Date.now() });
-      res.set("Retry-After", ra);
+      const waitS = armCooldown(cacheKey, ra);
+      res.set("Retry-After", String(waitS));
+      return res.status(429).json({ error: `offer-hold failed: ${e.message}`, retryAfter: String(waitS) });
     }
-    return res.status(is429 ? 429 : 502).json({ error: `offer-hold failed: ${e.message}`, retryAfter: is429 ? ra : undefined });
+    return res.status(502).json({ error: `offer-hold failed: ${e.message}` });
   } finally {
     _offerInflight.delete(cacheKey);
   }

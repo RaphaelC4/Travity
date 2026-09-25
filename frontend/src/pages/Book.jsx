@@ -201,13 +201,19 @@ export default function Book() {
           break;
         } catch (e) {
           const is429 = e.status === 429 || /429/.test(e.message || "");
-          if (is429 && attempt < 2) {
-            const waitS = Math.max(3, Math.min(60, parseInt(e.retryAfter, 10) || 5));
-            showToast(`Duffel is busy (429) — retrying in ${waitS}s… (attempt ${attempt + 2}/3)`, "status");
-            await new Promise((r) => setTimeout(r, waitS * 1000));
-            continue;
-          }
-          throw e;
+          if (!is429 || attempt >= 2) throw e;
+          // Our own per-IP throttle recovers in seconds; Duffel's window is
+          // honored in full (cap 3 min) so retries never fire into a live cooldown.
+          const ownLimit = /local rate limit/i.test(e.message || "");
+          const waitS = ownLimit ? 10 : Math.max(3, Math.min(180, parseInt(e.retryAfter, 10) || 10));
+          showToast(
+            ownLimit
+              ? "Server is busy — retrying in 10s… (attempt 2/3)"
+              : `Duffel is busy (429) — retrying in ${waitS}s… (attempt ${attempt + 2}/3)`,
+            "status"
+          );
+          await new Promise((r) => setTimeout(r, waitS * 1000));
+          continue;
         }
       }
       const offerId = hold.offerId || hold.offer_id || "";
