@@ -54,7 +54,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "travity-booking-provider", duffelConfigured: Boolean(String(process.env.DUFFEL_API_KEY || "").trim()) }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "travity-booking-provider", duffelConfigured: Boolean(String(process.env.DUFFEL_API_KEY || "").trim()), providerKeyConfigured: Boolean(PROVIDER_API_KEY), commit: String(process.env.RENDER_GIT_COMMIT || "local").slice(0, 7) }));
 
 const limiter = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false });
 
