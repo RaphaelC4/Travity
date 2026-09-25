@@ -287,16 +287,23 @@ function validPassengerPII(p) {
 
 async function createOrderViaProvider(offerId, passengerId, totalAmount, totalCurrency, passenger) {
   const base = String(process.env.BOOKING_PROVIDER_URL || "").trim().replace(/\/book\/?$/, "");
-  if (!base) return null;
+  if (!base) throw new Error("BOOKING_PROVIDER_URL not configured");
   const url = `${base}/confirm`;
   const apiKey = String(process.env.BOOKING_PROVIDER_API_KEY || "").trim();
+  let res;
   try {
-    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) }, body: JSON.stringify({ offerId, passengerId, totalAmount, totalCurrency, passenger }) });
-    if (!res.ok) return null;
-    const j = await res.json().catch(() => ({}));
-    if (!j.duffelOrderId) return null;
-    return { duffelOrderId: j.duffelOrderId, locator: j.locator, refundPolicy: j.refundPolicy };
-  } catch { return null; }
+    res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) }, body: JSON.stringify({ offerId, passengerId, totalAmount, totalCurrency, passenger }) });
+  } catch (e) {
+    console.error("[quote-server] confirm unreachable:", e.message);
+    throw new Error(`booking provider unreachable: ${e.message}`);
+  }
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    console.error("[quote-server] confirm failed:", res.status, j.error || "");
+    throw new Error(j.error || `booking provider confirm failed (${res.status})`);
+  }
+  if (!j.duffelOrderId) throw new Error("booking provider returned no order id");
+  return { duffelOrderId: j.duffelOrderId, locator: j.locator, refundPolicy: j.refundPolicy };
 }
 
 // Live re-verification at dispute time: asks the booking-provider to re-fetch
@@ -1141,8 +1148,14 @@ app.post("/api/confirm-purchase", reserveLimiter, async (req, res) => {
       return res.status(409).json({ error: "offer held for another booking" });
     }
     if (!holdRec.passengerPII) return res.status(409).json({ error: "held offer has no passenger record; re-hold with traveler details" });
-    const order = await createOrderViaProvider(offerId, passengerId, holdRec?.totalAmount, holdRec?.totalCurrency, holdRec.passengerPII);
-    if (!order) return res.status(502).json({ error: "Duffel purchase failed" });
+    let order;
+    try {
+      order = await createOrderViaProvider(offerId, passengerId, holdRec?.totalAmount, holdRec?.totalCurrency, holdRec.passengerPII);
+    } catch (e) {
+      // Surface the provider/Duffel reason verbatim (price mismatch, balance,
+      // offer expired) instead of a generic purchase failure.
+      return res.status(502).json({ error: `Duffel purchase failed: ${e.message}` });
+    }
     // update cached hold with real order
     // find hold by offerId
     if (holdKey) {
