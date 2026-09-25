@@ -5,6 +5,9 @@ import { WalletButton } from "../components/WalletButton";
 
 const BOOK_KEY = "travity.book.v1";
 
+const TRAVELER_FIELDS = ["given_name", "family_name", "born_on", "gender", "title", "email", "phone_number"];
+const emptyTraveler = () => ({ given_name: "", family_name: "", born_on: "", gender: "", title: "", email: "", phone_number: "" });
+
 const persistBookState = (form, quote, booking) => {
   try {
     localStorage.setItem(
@@ -34,6 +37,7 @@ const loadBookState = () => {
         destination: String(raw.form?.destination ?? "LHR"),
         depart: String(raw.form?.depart ?? ""),
         ret: String(raw.form?.ret ?? ""),
+        traveler: { ...emptyTraveler(), ...((raw.form?.traveler && typeof raw.form.traveler === "object") ? raw.form.traveler : {}) },
       },
       quote: raw.quote
         ? {
@@ -54,7 +58,11 @@ const loadBookState = () => {
 
 export default function Book() {
   const restored = loadBookState();
-  const [form, setForm] = useState(restored?.form ?? { origin: "JFK", destination: "LHR", depart: "", ret: "" });
+  const [form, setForm] = useState(() => {
+    const base = restored?.form ?? { origin: "JFK", destination: "LHR", depart: "", ret: "" };
+    const t = base.traveler && typeof base.traveler === "object" ? base.traveler : {};
+    return { ...base, traveler: { ...emptyTraveler(), ...t } };
+  });
   const [errors, setErrors] = useState({});
   const [quote, setQuote] = useState(restored?.quote ?? null);
   const [quoting, setQuoting] = useState(false);
@@ -92,6 +100,22 @@ export default function Book() {
     setForm((f) => ({ ...f, [k]: e.target.value }));
   };
 
+  const setTraveler = (k) => (e) => {
+    const v = e.target.value;
+    setErrors((prev) => ({ ...prev, [`traveler.${k}`]: undefined }));
+    setForm((f) => ({ ...f, traveler: { ...f.traveler, [k]: v } }));
+  };
+
+  const validateTraveler = (t) => {
+    const errs = {};
+    for (const f of TRAVELER_FIELDS) {
+      if (!String(t?.[f] ?? "").trim()) errs[`traveler.${f}`] = "Required.";
+    }
+    if (t?.born_on && Number.isNaN(Date.parse(t.born_on))) errs["traveler.born_on"] = "Must be a valid date (YYYY-MM-DD).";
+    if (t?.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(t.email)) errs["traveler.email"] = "Invalid email.";
+    return errs;
+  };
+
   const showToast = (msg, kind = "status") => setToast({ msg, kind });
 
   async function fetchQuote(e) {
@@ -121,6 +145,12 @@ export default function Book() {
 
   async function confirmBooking() {
     if (!quote) return;
+    const tErrs = validateTraveler(form.traveler);
+    if (Object.keys(tErrs).length > 0) {
+      setErrors((prev) => ({ ...prev, ...tErrs }));
+      showToast("Booking failed: traveler details are incomplete.", "alert");
+      return;
+    }
     setBusy(true);
     try {
       // Two-step: 1) hold offer (no Duffel charge), 2) escrow on-chain, 3) purchase Duffel, 4) seal receipt
@@ -143,6 +173,7 @@ export default function Book() {
           hold = await client.createReservation({
             origin: form.origin, destination: form.destination,
             depart: form.depart, ret: form.ret,
+            passenger: { ...form.traveler },
           });
           break;
         } catch (e) {
@@ -305,6 +336,52 @@ export default function Book() {
               </div>
             )}
           </form>
+
+          <div className="panel" style={{ marginTop: 24 }}>
+            <h2>Traveler details</h2>
+            <p className="hint">Ticketed verbatim on the Duffel order — no placeholders.</p>
+            <div className="form-row two">
+              <div className="form-field">
+                <label htmlFor="t-given">Given name</label>
+                <input id="t-given" value={form.traveler.given_name} onChange={setTraveler("given_name")} autoComplete="given-name" />
+                {errors["traveler.given_name"] && <p className="err-msg" role="alert">{errors["traveler.given_name"]}</p>}
+              </div>
+              <div className="form-field">
+                <label htmlFor="t-family">Family name</label>
+                <input id="t-family" value={form.traveler.family_name} onChange={setTraveler("family_name")} autoComplete="family-name" />
+                {errors["traveler.family_name"] && <p className="err-msg" role="alert">{errors["traveler.family_name"]}</p>}
+              </div>
+            </div>
+            <div className="form-row three">
+              <div className="form-field">
+                <label htmlFor="t-dob">Born on (YYYY-MM-DD)</label>
+                <input id="t-dob" value={form.traveler.born_on} onChange={setTraveler("born_on")} placeholder="1990-01-01" autoComplete="bday" />
+                {errors["traveler.born_on"] && <p className="err-msg" role="alert">{errors["traveler.born_on"]}</p>}
+              </div>
+              <div className="form-field">
+                <label htmlFor="t-gender">Gender (m/f)</label>
+                <input id="t-gender" value={form.traveler.gender} onChange={setTraveler("gender")} maxLength={1} autoComplete="off" />
+                {errors["traveler.gender"] && <p className="err-msg" role="alert">{errors["traveler.gender"]}</p>}
+              </div>
+              <div className="form-field">
+                <label htmlFor="t-title">Title (mr/ms)</label>
+                <input id="t-title" value={form.traveler.title} onChange={setTraveler("title")} maxLength={4} autoComplete="honorific-prefix" />
+                {errors["traveler.title"] && <p className="err-msg" role="alert">{errors["traveler.title"]}</p>}
+              </div>
+            </div>
+            <div className="form-row two">
+              <div className="form-field">
+                <label htmlFor="t-email">Email</label>
+                <input id="t-email" type="email" value={form.traveler.email} onChange={setTraveler("email")} autoComplete="email" />
+                {errors["traveler.email"] && <p className="err-msg" role="alert">{errors["traveler.email"]}</p>}
+              </div>
+              <div className="form-field">
+                <label htmlFor="t-phone">Phone</label>
+                <input id="t-phone" value={form.traveler.phone_number} onChange={setTraveler("phone_number")} autoComplete="tel" />
+                {errors["traveler.phone_number"] && <p className="err-msg" role="alert">{errors["traveler.phone_number"]}</p>}
+              </div>
+            </div>
+          </div>
 
           <div className="panel" style={{ marginTop: 24 }}>
             <h2>2 · Review &amp; pay</h2>

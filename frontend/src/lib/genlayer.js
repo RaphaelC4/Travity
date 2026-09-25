@@ -458,16 +458,16 @@ export class TravityClient {
 
   async signConfirmPurchase({ bookingId, offerId, account, provider }) {
     const message = `travity-confirm:${bookingId}|${offerId}|61999`;
-    try {
-      const sig = await provider.request?.({
-        method: "personal_sign",
-        params: [message, account],
-      });
-      if (typeof sig === "string" && sig) return sig;
-    } catch {
-      /* fall through to booking-bound fallback below */
+    // No fallback: the server ecRecovers this signature and rejects anything
+    // else. If the wallet cannot sign, booking stops here before any spend.
+    const sig = await provider.request?.({
+      method: "personal_sign",
+      params: [message, account],
+    });
+    if (typeof sig !== "string" || !sig.startsWith("0x")) {
+      throw new Error("Wallet signature required — approve the confirmation message in your wallet.");
     }
-    return `unverified:${account}:${bookingId}`;
+    return sig;
   }
 
   async confirmPurchase({ bookingId, orderId, locator, account, provider }) {

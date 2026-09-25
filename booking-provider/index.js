@@ -8,11 +8,30 @@ const PORT = Number(process.env.PORT || 3001);
 const PROVIDER_API_KEY = String(process.env.BOOKING_PROVIDER_API_KEY || process.env.PROVIDER_API_KEY || "").trim();
 
 function requireProviderAuth(req, res, next) {
-  if (!PROVIDER_API_KEY) return next();
+  // Fail closed in production: an unset shared secret must never mean open.
+  // Local dev (NODE_ENV!=production) stays open for harness convenience.
+  if (!PROVIDER_API_KEY) {
+    if (String(process.env.NODE_ENV || "").toLowerCase() === "production") {
+      return res.status(401).json({ error: "unauthorized: provider API key not configured" });
+    }
+    return next();
+  }
   const auth = String(req.headers.authorization || "");
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
   if (token !== PROVIDER_API_KEY) return res.status(401).json({ error: "unauthorized" });
   return next();
+}
+
+const PII_FIELDS = ["given_name", "family_name", "born_on", "gender", "title", "email", "phone_number"];
+
+function validPassenger(p) {
+  if (!p || typeof p !== "object") return "passenger object required";
+  for (const f of PII_FIELDS) {
+    if (!String(p[f] ?? "").trim()) return `passenger.${f} required`;
+  }
+  if (Number.isNaN(Date.parse(String(p.born_on)))) return "passenger.born_on must be a valid date";
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(p.email))) return "passenger.email invalid";
+  return null;
 }
 
 function toIso(yyyymmdd) {
@@ -63,7 +82,7 @@ app.post("/book", limiter, (req, res) => {
   return res.status(410).json({ error: "gone: use POST /offer-hold then hold_booking, then POST /confirm" });
 });
 
-app.post("/book-legacy", limiter, async (req, res) => {
+app.post("/book-legacy", limiter, requireProviderAuth, async (req, res) => {
   const from = String(req.body?.from ?? req.body?.origin ?? "").trim().toUpperCase();
   const to = String(req.body?.to ?? req.body?.destination ?? "").trim().toUpperCase();
   const departRaw = String(req.body?.depart ?? "").trim();
@@ -258,17 +277,32 @@ app.post("/confirm", limiter, requireProviderAuth, async (req, res) => {
   const pasId = String(req.body?.passengerId ?? req.body?.passenger_id ?? "").trim();
   const totalAmount = String(req.body?.totalAmount ?? req.body?.total_amount ?? "").trim();
   const totalCurrency = String(req.body?.totalCurrency ?? req.body?.total_currency ?? "USD").trim() || "USD";
+  const passenger = req.body?.passenger ?? null;
   if (!offerId.startsWith("off_")) return res.status(400).json({ error: "offerId required" });
   if (!pasId.startsWith("pas_")) return res.status(400).json({ error: "passengerId must be a Duffel pas_… from offer-hold" });
   if (!totalAmount) return res.status(400).json({ error: "totalAmount required (from offer-hold)" });
+  const piiErr = validPassenger(passenger);
+  if (piiErr) return res.status(400).json({ error: piiErr });
   const duffelKey = String(process.env.DUFFEL_API_KEY || "").trim();
   if (!duffelKey) return res.status(503).json({ error: "booking provider not configured: DUFFEL_API_KEY missing" });
   try {
+    // Re-fetch the offer live and verify the caller's amount matches Duffel's
+    // own total — never trust a caller-supplied price for the balance payment.
+    const offerLookup = await fetch(`https://api.duffel.com/air/offers/${encodeURIComponent(offerId)}`, {
+      headers: { Authorization: `Bearer ${duffelKey}`, "Duffel-Version": "v2" },
+    });
+    if (!offerLookup.ok) {
+      return res.status(502).json({ error: `Duffel offer lookup failed (${offerLookup.status})` });
+    }
+    const offerJson = await offerLookup.json();
+    const live = offerJson.data ?? {};
+    if (String(live.total_amount ?? "") !== totalAmount || String(live.total_currency ?? "").toUpperCase() !== totalCurrency.toUpperCase()) {
+      return res.status(409).json({ error: "offer total changed since hold; re-hold required" });
+    }
     const orderRes = await fetch("https://api.duffel.com/air/orders", {
       method: "POST",
       headers: { Authorization: `Bearer ${duffelKey}`, "Duffel-Version": "v2", "Content-Type": "application/json" },
-      // Test-mode PII placeholder: replace with real passenger details for live settlement.
-      body: JSON.stringify({ data: { type: "instant", selected_offers: [offerId], passengers: [{ id: pasId, given_name: "John", family_name: "Doe", born_on: "1990-01-01", gender: "m", title: "mr", email: "john.doe@example.com", phone_number: "+14155551234" }], payments: [{ type: "balance", amount: totalAmount, currency: totalCurrency }] } }),
+      body: JSON.stringify({ data: { type: "instant", selected_offers: [offerId], passengers: [{ id: pasId, given_name: String(passenger.given_name).trim(), family_name: String(passenger.family_name).trim(), born_on: String(passenger.born_on).trim(), gender: String(passenger.gender).trim(), title: String(passenger.title).trim(), email: String(passenger.email).trim(), phone_number: String(passenger.phone_number).trim() }], payments: [{ type: "balance", amount: totalAmount, currency: totalCurrency }] } }),
     });
     if (!orderRes.ok) {
       const txt = await orderRes.text().catch(() => "");

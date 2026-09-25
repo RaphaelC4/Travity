@@ -94,6 +94,45 @@ const AVIATIONSTACK_KEY = String(process.env.AVIATIONSTACK_KEY || "").trim();
 const OPERATOR_SECRET = String(
   process.env.OPERATOR_SECRET || process.env.PNR_SECRET || process.env.AGENCY_AUTH_TOKEN || ""
 ).trim();
+// GenLayer read path for finalized-state verification before any Duffel spend.
+// GENLAYER_CONTRACT_ADDRESS is the deployed TravelAgent; GENLAYER_RPC defaults
+// to Studionet. Unset contract address = purchases fail closed with 503.
+const GENLAYER_RPC = String(process.env.GENLAYER_RPC || process.env.VITE_GENLAYER_RPC || "https://studio.genlayer.com/api").trim();
+const GENLAYER_CONTRACT_ADDRESS = String(process.env.GENLAYER_CONTRACT_ADDRESS || process.env.VITE_GENLAYER_CONTRACT_ADDRESS || "").trim();
+const GENLAYER_CHAIN_ID = 61999;
+
+let _glClient = null;
+async function glClient() {
+  if (_glClient) return _glClient;
+  const { createClient } = await import("genlayer-js");
+  const { studionet } = await import("genlayer-js/chains");
+  _glClient = createClient({ chain: studionet, endpoint: GENLAYER_RPC });
+  return _glClient;
+}
+
+async function readBookingFinalized(bookingId) {
+  const client = await glClient();
+  const raw = await client.readContract({
+    address: GENLAYER_CONTRACT_ADDRESS,
+    functionName: "view_booking",
+    args: [bookingId],
+  });
+  const rec = typeof raw === "string" ? JSON.parse(raw) : raw;
+  if (!rec || typeof rec !== "object" || Object.keys(rec).length === 0) return null;
+  return rec;
+}
+
+async function verifyWalletSignature({ bookingId, offerId, walletAddr, walletSig }) {
+  if (!walletSig || walletSig.startsWith("unverified:")) return false;
+  const { verifyMessage } = await import("viem");
+  const message = `travity-confirm:${bookingId}|${offerId}|${GENLAYER_CHAIN_ID}`;
+  try {
+    const ok = await verifyMessage({ address: walletAddr, message, signature: walletSig });
+    return ok === true;
+  } catch {
+    return false;
+  }
+}
 // After the upstream proves itself down (5xx/network/429), skip further
 // upstream calls for this window instead of hot-looping a dead provider.
 const OUTAGE_COOLDOWN_MS = Number(process.env.OUTAGE_COOLDOWN_MS || 30 * 1000);
@@ -234,13 +273,25 @@ async function createHoldViaProvider(from, to, departIso) {
   return { offerId: j.offerId, passengerId: j.passengerId, itineraryJson: j.itinerary_json, expiresAt: j.expiresAt, totalAmount: j.totalAmount, totalCurrency: j.totalCurrency };
 }
 
-async function createOrderViaProvider(offerId, passengerId, totalAmount, totalCurrency) {
+const PII_FIELDS = ["given_name", "family_name", "born_on", "gender", "title", "email", "phone_number"];
+
+function validPassengerPII(p) {
+  if (!p || typeof p !== "object") return "passenger object required";
+  for (const f of PII_FIELDS) {
+    if (!String(p[f] ?? "").trim()) return `passenger.${f} required`;
+  }
+  if (Number.isNaN(Date.parse(String(p.born_on)))) return "passenger.born_on must be a valid date";
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(p.email))) return "passenger.email invalid";
+  return null;
+}
+
+async function createOrderViaProvider(offerId, passengerId, totalAmount, totalCurrency, passenger) {
   const base = String(process.env.BOOKING_PROVIDER_URL || "").trim().replace(/\/book\/?$/, "");
   if (!base) return null;
   const url = `${base}/confirm`;
   const apiKey = String(process.env.BOOKING_PROVIDER_API_KEY || "").trim();
   try {
-    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) }, body: JSON.stringify({ offerId, passengerId, totalAmount, totalCurrency }) });
+    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) }, body: JSON.stringify({ offerId, passengerId, totalAmount, totalCurrency, passenger }) });
     if (!res.ok) return null;
     const j = await res.json().catch(() => ({}));
     if (!j.duffelOrderId) return null;
@@ -923,6 +974,11 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
   const to = String(req.body?.to || "").trim().toUpperCase();
   const depart = String(req.body?.depart || "").trim();
   const ret = String(req.body?.ret || "").trim();
+  const passengerPII = req.body?.passenger ?? null;
+  // Traveler identity is required up front: it travels with the hold and is
+  // the exact record Duffel tickets at confirm time. No dummy fallback.
+  const piiErr = validPassengerPII(passengerPII);
+  if (piiErr) return res.status(400).json({ error: piiErr });
   try {
     const { from: f, to: t, depart: d, ret: r } = parseRoute({ query: { from, to, depart, ret } });
     if (!BOOKING_PROVIDER_URL) {
@@ -958,6 +1014,7 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
       refundPolicy: null,
       offerId: offerId ?? null,
       passenger_id: passengerId ?? null,
+      passengerPII: passengerPII ?? null,
       itinerary_json: boundItineraryJson ?? null,
       totalAmount: totalAmount ?? null,
       totalCurrency: totalCurrency ?? null,
@@ -975,6 +1032,7 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
     }
     if (!record.offerId && offerId) record.offerId = offerId;
     if (!record.passenger_id && passengerId) record.passenger_id = passengerId;
+    if (!record.passengerPII && passengerPII) record.passengerPII = passengerPII;
     if (!record.itinerary_json && boundItineraryJson) record.itinerary_json = boundItineraryJson;
     cache.reservations.set(pnr, record);
     saveReservations();
@@ -991,25 +1049,66 @@ app.post("/api/confirm-purchase", reserveLimiter, async (req, res) => {
   const offerId = String(req.body?.offerId || req.body?.offer_id || "").trim();
   const passengerId = String(req.body?.passengerId || req.body?.passenger_id || "").trim();
   if (!bookingId || !offerId) return res.status(400).json({ error: "bookingId and offerId required" });
-  // Dual auth: operator token OR customer wallet identity (signature verified on-chain at confirm_purchase).
+  // Dual auth: operator token OR customer wallet signature (ecRecovered here,
+  // enforced again on-chain by confirm_purchase's only-booking-customer check).
   const auth = String(req.headers.authorization || "");
   const bearer = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
   const walletAddr = String(req.headers["x-wallet-address"] || "").trim();
   const walletSig = String(req.headers["x-wallet-signature"] || "").trim();
   const isOperator = Boolean(OPERATOR_SECRET) && bearer === OPERATOR_SECRET;
-  const isCustomer = Boolean(walletAddr) && Boolean(walletSig);
-  if (!isOperator && !isCustomer) {
+  if (!isOperator && !(walletAddr && walletSig)) {
     return res.status(401).json({ error: "unauthorized: operator token or wallet signature required" });
   }
   try {
-    // Bind caller to held booking: bookingId is key+"-"+sender, so it must end with the wallet address.
-    // Operator cron path skips this (it reconciles, never spends without a prior hold).
-    if (isCustomer && !isOperator) {
+    // Customer path: signature must recover to the claimed wallet, and the
+    // wallet must match the booking customer suffix. Operator cron path skips
+    // this (it reconciles, never spends without a prior hold).
+    if (!isOperator) {
       const bidLower = bookingId.toLowerCase();
       const wLower = walletAddr.toLowerCase();
       if (!bidLower.endsWith(wLower)) {
         return res.status(403).json({ error: "wallet address does not match booking customer" });
       }
+      const sigOk = await verifyWalletSignature({ bookingId, offerId, walletAddr, walletSig });
+      if (!sigOk) {
+        return res.status(403).json({ error: "invalid wallet signature for this booking and offer" });
+      }
+    }
+    // Finalized GenLayer state must agree before any Duffel spend: the held
+    // booking, offer, passenger, and escrow amount all come from chain, never
+    // from caller-supplied strings alone. Fail closed on RPC failure.
+    if (!GENLAYER_CONTRACT_ADDRESS) {
+      return res.status(503).json({ error: "chain verification unavailable: GENLAYER_CONTRACT_ADDRESS not configured" });
+    }
+    let chainBooking;
+    try {
+      chainBooking = await readBookingFinalized(bookingId);
+    } catch (e) {
+      console.error("[quote-server] view_booking RPC failed:", e.message);
+      return res.status(502).json({ error: "chain verification unavailable: GenLayer read failed" });
+    }
+    if (!chainBooking) {
+      return res.status(404).json({ error: "booking not found in finalized chain state" });
+    }
+    if (String(chainBooking.status || "") !== "held") {
+      return res.status(409).json({ error: `booking is ${chainBooking.status || "unknown"}, not held` });
+    }
+    if (String(chainBooking.offer_id || "") !== offerId) {
+      return res.status(409).json({ error: "offer does not match held booking on chain" });
+    }
+    if (passengerId && String(chainBooking.passenger_id || "") !== passengerId) {
+      return res.status(409).json({ error: "passenger does not match held booking on chain" });
+    }
+    if (!isOperator && String(chainBooking.customer || "").toLowerCase() !== walletAddr.toLowerCase()) {
+      return res.status(403).json({ error: "wallet is not the booking customer on chain" });
+    }
+    // hold_expiry is a unix-seconds timestamp on chain.
+    if (Number(chainBooking.hold_expiry || 0) * 1000 <= Date.now()) {
+      return res.status(410).json({ error: "hold expired on chain; re-hold required" });
+    }
+    // Escrow must actually be locked on chain (not just claimed by the caller).
+    if (!(Number(chainBooking.price_wei || 0) > 0 && Number(chainBooking.paid_wei || 0) >= Number(chainBooking.price_wei || 0))) {
+      return res.status(409).json({ error: "no locked escrow for this booking on chain" });
     }
     // Look up hold to get exact Duffel total for payment (must match offer total)
     let holdRec = null;
@@ -1040,7 +1139,8 @@ app.post("/api/confirm-purchase", reserveLimiter, async (req, res) => {
     } else if (holdRec.bookingId !== bookingId) {
       return res.status(409).json({ error: "offer held for another booking" });
     }
-    const order = await createOrderViaProvider(offerId, passengerId, holdRec?.totalAmount, holdRec?.totalCurrency);
+    if (!holdRec.passengerPII) return res.status(409).json({ error: "held offer has no passenger record; re-hold with traveler details" });
+    const order = await createOrderViaProvider(offerId, passengerId, holdRec?.totalAmount, holdRec?.totalCurrency, holdRec.passengerPII);
     if (!order) return res.status(502).json({ error: "Duffel purchase failed" });
     // update cached hold with real order
     // find hold by offerId
