@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { parsePhoneNumber } from "libphonenumber-js";
 import { client, fmtGen, fmtUsd } from "../lib/genlayer";
 import { useWallet } from "../hooks/useWallet";
 import { WalletButton } from "../components/WalletButton";
@@ -106,6 +107,21 @@ export default function Book() {
     setForm((f) => ({ ...f, traveler: { ...f.traveler, [k]: v } }));
   };
 
+  // Canonicalize to library E.164 (drops trunk 0, keeps significant 0s).
+  // Returns { e164 } or { error } — same rule Duffel enforces server-side.
+  const canonicalPhone = (raw) => {
+    let parsed;
+    try {
+      parsed = parsePhoneNumber(String(raw ?? ""));
+    } catch {
+      return { error: "Use international format starting with +, e.g. +2348012345678 — local formats like 0801… are rejected." };
+    }
+    if (!parsed.isPossible()) {
+      return { error: "Wrong digit count for that country — check and re-enter, e.g. +2348012345678." };
+    }
+    return { e164: parsed.number };
+  };
+
   const validateTraveler = (t) => {
     const errs = {};
     for (const f of TRAVELER_FIELDS) {
@@ -113,8 +129,9 @@ export default function Book() {
     }
     if (t?.born_on && Number.isNaN(Date.parse(t.born_on))) errs["traveler.born_on"] = "Must be a valid date (YYYY-MM-DD).";
     if (t?.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(t.email)) errs["traveler.email"] = "Invalid email.";
-    if (t?.phone_number && !/^\+[1-9]\d{6,14}$/.test(String(t.phone_number).replace(/[\s\-()]/g, ""))) {
-      errs["traveler.phone_number"] = "Use international format starting with +, e.g. +2348012345678 — Duffel rejects local formats like 0801…";
+    if (t?.phone_number) {
+      const { error } = canonicalPhone(t.phone_number);
+      if (error) errs["traveler.phone_number"] = error;
     }
     return errs;
   };
@@ -154,6 +171,9 @@ export default function Book() {
       showToast("Booking failed: traveler details are incomplete.", "alert");
       return;
     }
+    // Send Duffel the canonical number (e.g. +2340803… → +234803…).
+    const { e164: canonicalPhoneNumber } = canonicalPhone(form.traveler.phone_number);
+    const traveler = { ...form.traveler, phone_number: canonicalPhoneNumber };
     setBusy(true);
     try {
       // Two-step: 1) hold offer (no Duffel charge), 2) escrow on-chain, 3) purchase Duffel, 4) seal receipt
@@ -176,7 +196,7 @@ export default function Book() {
           hold = await client.createReservation({
             origin: form.origin, destination: form.destination,
             depart: form.depart, ret: form.ret,
-            passenger: { ...form.traveler },
+            passenger: { ...traveler },
           });
           break;
         } catch (e) {

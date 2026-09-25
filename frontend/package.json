@@ -13,6 +13,7 @@
     "@phosphor-icons/react": "^2.1.10",
     "@walletconnect/ethereum-provider": "2.23.10",
     "genlayer-js": "1.1.8",
+    "libphonenumber-js": "^1.13.14",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-router-dom": "^7.18.2"

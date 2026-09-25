@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import rateLimit from "express-rate-limit";
+import { parsePhoneNumber } from "libphonenumber-js";
 
 const PORT = Number(process.env.PORT || 3001);
 // Shared secret with travity-server (BOOKING_PROVIDER_API_KEY). When set,
@@ -31,12 +32,28 @@ function validPassenger(p) {
   }
   if (Number.isNaN(Date.parse(String(p.born_on)))) return "passenger.born_on must be a valid date";
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(p.email))) return "passenger.email invalid";
-  // Duffel rejects non-E.164 numbers with 422 at order time; fail fast here
-  // with the fix attached instead of burning a Duffel call.
-  if (!/^\+[1-9]\d{6,14}$/.test(String(p.phone_number).replace(/[\s\-()]/g, ""))) {
-    return "passenger.phone_number must be E.164 international format, e.g. +2348012345678 (not 0801…)";
-  }
+  // Duffel validates numbers strictly (libphonenumber rules). A regex shape
+  // check is not enough: +2340803… (trunk 0 kept) or wrong-length numbers
+  // pass E.164 shape but Duffel 422s them. Canonicalize via the library and
+  // fail fast with the fix attached instead of burning a Duffel call.
+  const norm = normalizePhone(p.phone_number);
+  if (norm.error) return norm.error;
   return null;
+}
+
+// Canonicalize to library E.164 (drops trunk 0 like Nigeria's 0803→803,
+// keeps significant 0s like Italy's). Returns {e164} or {error}.
+function normalizePhone(raw) {
+  let parsed;
+  try {
+    parsed = parsePhoneNumber(String(raw ?? ""));
+  } catch {
+    return { error: "passenger.phone_number must be international format starting with +, e.g. +2348012345678 (not 0801…)" };
+  }
+  if (!parsed.isPossible()) {
+    return { error: "passenger.phone_number has wrong digit count for its country — check and re-enter, e.g. +2348012345678" };
+  }
+  return { e164: parsed.number };
 }
 
 function toIso(yyyymmdd) {
@@ -288,6 +305,8 @@ app.post("/confirm", limiter, requireProviderAuth, async (req, res) => {
   if (!totalAmount) return res.status(400).json({ error: "totalAmount required (from offer-hold)" });
   const piiErr = validPassenger(passenger);
   if (piiErr) return res.status(400).json({ error: piiErr });
+  // Send Duffel the canonical E.164 form, never the raw input.
+  const normPhone = normalizePhone(passenger.phone_number);
   const duffelKey = String(process.env.DUFFEL_API_KEY || "").trim();
   if (!duffelKey) return res.status(503).json({ error: "booking provider not configured: DUFFEL_API_KEY missing" });
   try {
@@ -307,7 +326,7 @@ app.post("/confirm", limiter, requireProviderAuth, async (req, res) => {
     const orderRes = await fetch("https://api.duffel.com/air/orders", {
       method: "POST",
       headers: { Authorization: `Bearer ${duffelKey}`, "Duffel-Version": "v2", "Content-Type": "application/json" },
-      body: JSON.stringify({ data: { type: "instant", selected_offers: [offerId], passengers: [{ id: pasId, given_name: String(passenger.given_name).trim(), family_name: String(passenger.family_name).trim(), born_on: String(passenger.born_on).trim(), gender: String(passenger.gender).trim(), title: String(passenger.title).trim(), email: String(passenger.email).trim(), phone_number: String(passenger.phone_number).replace(/[\s\-()]/g, "") }], payments: [{ type: "balance", amount: totalAmount, currency: totalCurrency }] } }),
+      body: JSON.stringify({ data: { type: "instant", selected_offers: [offerId], passengers: [{ id: pasId, given_name: String(passenger.given_name).trim(), family_name: String(passenger.family_name).trim(), born_on: String(passenger.born_on).trim(), gender: String(passenger.gender).trim(), title: String(passenger.title).trim(), email: String(passenger.email).trim(), phone_number: normPhone.e164 }], payments: [{ type: "balance", amount: totalAmount, currency: totalCurrency }] } }),
     });
     if (!orderRes.ok) {
       // Forward Duffel's structured errors array verbatim (field + title per

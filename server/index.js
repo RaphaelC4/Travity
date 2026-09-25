@@ -275,15 +275,24 @@ async function createHoldViaProvider(from, to, departIso) {
 
 const PII_FIELDS = ["given_name", "family_name", "born_on", "gender", "title", "email", "phone_number"];
 
-function validPassengerPII(p) {
+async function validPassengerPIIAsync(p) {
   if (!p || typeof p !== "object") return "passenger object required";
   for (const f of PII_FIELDS) {
     if (!String(p[f] ?? "").trim()) return `passenger.${f} required`;
   }
   if (Number.isNaN(Date.parse(String(p.born_on)))) return "passenger.born_on must be a valid date";
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(p.email))) return "passenger.email invalid";
-  if (!/^\+[1-9]\d{6,14}$/.test(String(p.phone_number).replace(/[\s\-()]/g, ""))) {
-    return "passenger.phone_number must be E.164 international format, e.g. +2348012345678 (not 0801…)";
+  // Mirror the provider gate: canonical libphonenumber parse, not regex shape.
+  // (Trunk-0 numbers like +2340803… pass E.164 shape yet Duffel 422s them.)
+  let parsed;
+  try {
+    const { parsePhoneNumber } = await import("libphonenumber-js");
+    parsed = parsePhoneNumber(String(p.phone_number ?? ""));
+  } catch {
+    return "passenger.phone_number must be international format starting with +, e.g. +2348012345678 (not 0801…)";
+  }
+  if (!parsed.isPossible()) {
+    return "passenger.phone_number has wrong digit count for its country — check and re-enter, e.g. +2348012345678";
   }
   return null;
 }
@@ -988,7 +997,7 @@ app.post("/api/reserve", reserveLimiter, async (req, res) => {
   const passengerPII = req.body?.passenger ?? null;
   // Traveler identity is required up front: it travels with the hold and is
   // the exact record Duffel tickets at confirm time. No dummy fallback.
-  const piiErr = validPassengerPII(passengerPII);
+  const piiErr = await validPassengerPIIAsync(passengerPII);
   if (piiErr) return res.status(400).json({ error: piiErr });
   try {
     const { from: f, to: t, depart: d, ret: r } = parseRoute({ query: { from, to, depart, ret } });
