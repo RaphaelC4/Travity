@@ -282,6 +282,9 @@ function validPassengerPII(p) {
   }
   if (Number.isNaN(Date.parse(String(p.born_on)))) return "passenger.born_on must be a valid date";
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(p.email))) return "passenger.email invalid";
+  if (!/^\+[1-9]\d{6,14}$/.test(String(p.phone_number).replace(/[\s\-()]/g, ""))) {
+    return "passenger.phone_number must be E.164 international format, e.g. +2348012345678 (not 0801…)";
+  }
   return null;
 }
 

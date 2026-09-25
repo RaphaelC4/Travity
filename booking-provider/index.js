@@ -31,6 +31,11 @@ function validPassenger(p) {
   }
   if (Number.isNaN(Date.parse(String(p.born_on)))) return "passenger.born_on must be a valid date";
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(p.email))) return "passenger.email invalid";
+  // Duffel rejects non-E.164 numbers with 422 at order time; fail fast here
+  // with the fix attached instead of burning a Duffel call.
+  if (!/^\+[1-9]\d{6,14}$/.test(String(p.phone_number).replace(/[\s\-()]/g, ""))) {
+    return "passenger.phone_number must be E.164 international format, e.g. +2348012345678 (not 0801…)";
+  }
   return null;
 }
 
@@ -302,17 +307,31 @@ app.post("/confirm", limiter, requireProviderAuth, async (req, res) => {
     const orderRes = await fetch("https://api.duffel.com/air/orders", {
       method: "POST",
       headers: { Authorization: `Bearer ${duffelKey}`, "Duffel-Version": "v2", "Content-Type": "application/json" },
-      body: JSON.stringify({ data: { type: "instant", selected_offers: [offerId], passengers: [{ id: pasId, given_name: String(passenger.given_name).trim(), family_name: String(passenger.family_name).trim(), born_on: String(passenger.born_on).trim(), gender: String(passenger.gender).trim(), title: String(passenger.title).trim(), email: String(passenger.email).trim(), phone_number: String(passenger.phone_number).trim() }], payments: [{ type: "balance", amount: totalAmount, currency: totalCurrency }] } }),
+      body: JSON.stringify({ data: { type: "instant", selected_offers: [offerId], passengers: [{ id: pasId, given_name: String(passenger.given_name).trim(), family_name: String(passenger.family_name).trim(), born_on: String(passenger.born_on).trim(), gender: String(passenger.gender).trim(), title: String(passenger.title).trim(), email: String(passenger.email).trim(), phone_number: String(passenger.phone_number).replace(/[\s\-()]/g, "") }], payments: [{ type: "balance", amount: totalAmount, currency: totalCurrency }] } }),
     });
     if (!orderRes.ok) {
-      const txt = await orderRes.text().catch(() => "");
-      throw new Error(`Duffel create order ${orderRes.status}: ${txt.slice(0, 200)}`);
+      // Forward Duffel's structured errors array verbatim (field + title per
+      // failure, e.g. phone_number "Invalid phone number") instead of a
+      // truncated string, so the UI can name the exact field.
+      const body = await orderRes.json().catch(() => null);
+      if (body && Array.isArray(body.errors) && body.errors.length > 0) {
+        const first = body.errors[0];
+        const field = String(first?.source?.field ?? first?.source?.pointer ?? "request");
+        const title = String(first?.title ?? "rejected");
+        const err = new Error(`Duffel create order ${orderRes.status} (${field}): ${title}`);
+        err.duffelErrors = body.errors;
+        throw err;
+      }
+      const txt = body ? JSON.stringify(body).slice(0, 300) : await orderRes.text().catch(() => "");
+      throw new Error(`Duffel create order ${orderRes.status}: ${String(txt).slice(0, 300)}`);
     }
     const orderJson = await orderRes.json();
     const locator = String(orderJson.data?.booking_reference ?? orderJson.data?.id ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
     return res.json({ duffelOrderId: orderJson.data?.id ?? null, locator, refundPolicy: refundPolicyFrom(orderJson.data?.conditions) });
   } catch (e) {
-    return res.status(502).json({ error: `confirm failed: ${e.message}` });
+    const out = { error: `confirm failed: ${e.message}` };
+    if (Array.isArray(e.duffelErrors)) out.duffelErrors = e.duffelErrors;
+    return res.status(502).json(out);
   }
 });
 

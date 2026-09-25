@@ -113,6 +113,9 @@ export default function Book() {
     }
     if (t?.born_on && Number.isNaN(Date.parse(t.born_on))) errs["traveler.born_on"] = "Must be a valid date (YYYY-MM-DD).";
     if (t?.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(t.email)) errs["traveler.email"] = "Invalid email.";
+    if (t?.phone_number && !/^\+[1-9]\d{6,14}$/.test(String(t.phone_number).replace(/[\s\-()]/g, ""))) {
+      errs["traveler.phone_number"] = "Use international format starting with +, e.g. +2348012345678 — Duffel rejects local formats like 0801…";
+    }
     return errs;
   };
 
@@ -376,8 +379,8 @@ export default function Book() {
                 {errors["traveler.email"] && <p className="err-msg" role="alert">{errors["traveler.email"]}</p>}
               </div>
               <div className="form-field">
-                <label htmlFor="t-phone">Phone</label>
-                <input id="t-phone" value={form.traveler.phone_number} onChange={setTraveler("phone_number")} autoComplete="tel" />
+                <label htmlFor="t-phone">Phone (international, +…)</label>
+                <input id="t-phone" value={form.traveler.phone_number} onChange={setTraveler("phone_number")} autoComplete="tel" placeholder="+2348012345678" />
                 {errors["traveler.phone_number"] && <p className="err-msg" role="alert">{errors["traveler.phone_number"]}</p>}
               </div>
             </div>
