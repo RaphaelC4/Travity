@@ -34,3 +34,7 @@ Thumbs.db
 .opencode/
 # Runtime reservation overlay/audit state
 server/data/
+
+# Local test-run artifacts (regenerable)
+pytest_out.txt
+server/suitestd*.txt
