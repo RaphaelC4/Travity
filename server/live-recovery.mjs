@@ -63,7 +63,7 @@ const PII = {
 const [o, d] = [ORIGIN.toUpperCase(), DESTINATION.toUpperCase()];
 const holdRes = await fetch(`${QUOTE_API}/api/reserve`, {
   method: "POST",
-  headers: { "Content-Type": "application/json", ...(process.env.BOOKING_PROVIDER_API_KEY ? {} : {}) },
+  headers: { "Content-Type": "application/json", ...(process.env.BOOKING_PROVIDER_API_KEY ? { Authorization: `Bearer ${process.env.BOOKING_PROVIDER_API_KEY}` } : {}) },
   body: JSON.stringify({ from: o, to: d, depart: DEPART, ret: RET, passenger: PII }),
 });
 const hold = await holdRes.json().catch(() => ({}));

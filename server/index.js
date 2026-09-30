@@ -116,6 +116,13 @@ async function readBookingFinalized(bookingId) {
     address: GENLAYER_CONTRACT_ADDRESS,
     functionName: "view_booking",
     args: [bookingId],
+    // Trust boundary: every pre-spend decision (booking held, offer/passenger/
+    // customer match, escrow fully locked) reads CONSENSUS-FINALIZED state
+    // only. The SDK default is "latest-nonfinal", which would let a pending,
+    // not-yet-consensus transaction outcome satisfy the check; a booking
+    // whose hold tx is still finalizing reads as not-found here (404) and
+    // the caller retries — never spend against unsealed state.
+    transactionHashVariant: "latest-final",
   });
   const rec = typeof raw === "string" ? JSON.parse(raw) : raw;
   if (!rec || typeof rec !== "object" || Object.keys(rec).length === 0) return null;
@@ -954,7 +961,9 @@ app.get("/status", (req, res) => {
   }
 
   const ref = String(req.query.ref || "").trim().toUpperCase();
-  if (!ref || !/^[A-Z0-9]{4,12}$/.test(ref)) {
+  // Shape check only (the binding lookup is the real gate); the hyphen admits
+  // this server's own HOLD- refs issued by /api/reserve.
+  if (!ref || !/^[A-Z0-9-]{4,16}$/.test(ref)) {
     return res.status(400).json({ error: "invalid reservation ref" });
   }
   const binding = cache.reservations.get(ref);
@@ -983,7 +992,9 @@ app.get("/status", (req, res) => {
 // it. The frontend POSTs here before escrowing on-chain.
 const reserveLimiter = rateLimit({
   windowMs: 60_000,
-  limit: 10,
+  // RESERVE_RATE_LIMIT raises the per-minute budget (integration tests, busy
+  // frontends). Default stays 10/min/IP.
+  limit: Number(process.env.RESERVE_RATE_LIMIT || 10),
   standardHeaders: true,
   legacyHeaders: false,
   handler: (_req, res) => res.status(429).json({ error: "Too many reservations. Try again shortly." }),
@@ -1197,7 +1208,8 @@ app.post("/api/confirm-purchase", reserveLimiter, async (req, res) => {
 // /status uses, so the evidence shape is stable in every environment.
 app.get("/provider-status", async (req, res) => {
   const ref = String(req.query.ref || "").trim().toUpperCase();
-  if (!ref || !/^[A-Z0-9]{4,12}$/.test(ref)) {
+  // Same shape rule as GET /status: hyphen admits this server's HOLD- refs.
+  if (!ref || !/^[A-Z0-9-]{4,16}$/.test(ref)) {
     return res.status(400).json({ error: "invalid reservation ref" });
   }
   const from = String(req.query.from || "").trim().toUpperCase();
@@ -1283,17 +1295,35 @@ app.get("/provider-status", async (req, res) => {
 // /status still derives from the date rule whenever no override exists.
 const statusLimiter = rateLimit({
   windowMs: 60_000,
-  limit: 10,
+  // STATUS_RATE_LIMIT raises the per-minute budget (integration tests run the
+  // reaper repeatedly). Default stays 10/min/IP.
+  limit: Number(process.env.STATUS_RATE_LIMIT || 10),
   standardHeaders: true,
   legacyHeaders: false,
   handler: (_req, res) => res.status(429).json({ error: "Too many status updates. Try again shortly." }),
 });
 
-// Reaper for expired holds: lists holds past holdExpiry with no Duffel order
-// (caller must run cancel_hold on-chain to refund escrow), plus orphan paid
-// orders never sealed via confirm_purchase. Operator-only. With
-// {"execute": true} it best-effort cancels orphan Duffel orders via the
-// provider so test-mode balance isn't left holding unlinked tickets.
+// Reaper + reconciliation for half-finished live bookings. Two lists:
+// (1) expired holds: a hold past its 900s Duffel window with no Duffel order
+//     — the caller runs cancel_hold on-chain to refund the escrow;
+// (2) orphan paid orders: a Duffel order exists but the reservation record was
+//     never marked reconciled, i.e. confirm_purchase may never have sealed.
+//
+// Trust boundary: a paid Duffel order is NEVER cancelled on this server's own
+// say-so. Each orphan is first re-read from finalized GenLayer state:
+//   confirmed           -> the order backs a sealed booking; keep the order
+//                          and mark the record reconciled (the prior behavior
+//                          cancelled exactly these — destroying paid tickets
+//                          behind on-chain-confirmed bookings).
+//   cancelled           -> booking refunded on-chain; the order can never be
+//                          sealed, so cancel it to recover the balance.
+//   held, hold expired  -> a late confirm now reverts; cancel the order.
+//   held, hold active   -> confirm could still land; leave it alone.
+//   RPC failure / booking missing / record without bookingId -> fail closed:
+//                          do not touch the order, surface the reason.
+// Cancellation is idempotent: the live provider order is checked first, and a
+// provider "already cancelled" rejection still counts as reconciled.
+// Dry-run by default; {"execute": true} performs the actions. Operator-only.
 // Intended caller: external scheduler every 5 min (Render cron needs a paid
 // plan, so use cron-job.org or similar against this endpoint).
 app.post("/api/reaper", statusLimiter, async (req, res) => {
@@ -1302,10 +1332,29 @@ app.post("/api/reaper", statusLimiter, async (req, res) => {
   if (!OPERATOR_SECRET || token !== OPERATOR_SECRET) {
     return res.status(401).json({ error: "unauthorized" });
   }
+  if (!GENLAYER_CONTRACT_ADDRESS) {
+    return res.status(503).json({ error: "chain verification unavailable: GENLAYER_CONTRACT_ADDRESS not configured" });
+  }
   const execute = req.body?.execute === true;
   const now = Date.now();
+  const minAgeMs = Number(process.env.REAPER_MIN_AGE_MS || 30 * 60 * 1000);
   const expired = [];
-  const orphans = [];
+  // Orphan candidates, deduped by order id: the confirm path re-keys the same
+  // record under the Duffel locator, so one order can sit on two entries.
+  // Prefer the primary (non-alias) entry so updates hit the real record.
+  const byOrder = new Map();
+  for (const [k, v] of cache.reservations.entries()) {
+    if (!v.providerOrderId || v.reconciled) continue;
+    if (!v.orderCreatedAt || now - Number(v.orderCreatedAt) <= minAgeMs) continue;
+    // Prefer the canonical (hold-keyed) record: after confirm re-keys ref to
+    // the Duffel locator, the locator-keyed entry is a frozen copy, so
+    // reconciliation updates must land on the record the server mutates.
+    const canonical = k !== v.ref;
+    const cur = byOrder.get(v.providerOrderId);
+    if (!cur || (!cur.canonical && canonical)) {
+      byOrder.set(v.providerOrderId, { orderId: v.providerOrderId, ref: k, bookingId: v.bookingId ?? null, canonical });
+    }
+  }
   for (const [k, v] of cache.reservations.entries()) {
     if (k !== v.ref) continue; // skip locator alias entries
     // Expired hold, never purchased: on-chain cancel_hold refunds escrow.
@@ -1313,36 +1362,94 @@ app.post("/api/reaper", statusLimiter, async (req, res) => {
       const deadline = Number(v.createdAt || 0) + 900000; // 900s Duffel offer window
       if (deadline && now > deadline) expired.push({ ref: k, offerId: v.offerId, bookingId: v.bookingId ?? null });
     }
-    // Paid Duffel order whose on-chain confirm_purchase may never have landed:
-    // operator verifies view_booking, then confirms or cancels.
-    if (v.providerOrderId && v.orderCreatedAt && now - Number(v.orderCreatedAt) > 30 * 60 * 1000 && !v.reconciled) {
-      orphans.push({ ref: k, orderId: v.providerOrderId, bookingId: v.bookingId ?? null });
-    }
   }
   const cancelled = [];
-  if (execute) {
-    const base = String(BOOKING_PROVIDER_URL || "").trim().replace(/\/book\/?$/, "");
-    for (const o of orphans) {
-      try {
-        const r = await fetch(`${base}/cancel`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", ...(BOOKING_PROVIDER_API_KEY ? { Authorization: `Bearer ${BOOKING_PROVIDER_API_KEY}` } : {}) },
-          body: JSON.stringify({ orderId: o.orderId }),
-        });
-        const j = await r.json().catch(() => ({}));
-        if (r.ok) {
-          cancelled.push(o.orderId);
-          const rec = cache.reservations.get(o.ref);
-          if (rec) { rec.reconciled = true; rec.updatedAt = Date.now(); }
-        } else {
-          o.cancelError = j.error || `cancel failed (${r.status})`;
-        }
-      } catch (e) {
-        o.cancelError = e.message;
-      }
+  const orphans = [];
+  for (const o of byOrder.values()) {
+    const entry = { ref: o.ref, orderId: o.orderId, bookingId: o.bookingId ?? null, action: "skip" };
+    const rec = cache.reservations.get(o.ref);
+    // Fail closed: without a bookingId there is no chain state to consult.
+    if (!o.bookingId) {
+      entry.reason = "no bookingId on record; cannot verify chain state";
+      orphans.push(entry);
+      continue;
     }
-    saveReservations();
+    // Fail closed: a failed chain read must never cost a paid order.
+    let chainBooking;
+    try {
+      chainBooking = await readBookingFinalized(o.bookingId);
+    } catch (e) {
+      entry.reason = `chain verification failed: ${e.message}`;
+      orphans.push(entry);
+      continue;
+    }
+    const chainStatus = String(chainBooking?.status || "");
+    if (!chainBooking || !chainStatus) {
+      entry.reason = "booking not found in finalized chain state";
+      orphans.push(entry);
+      continue;
+    }
+    if (chainStatus === "confirmed") {
+      // The order backs a sealed booking — keep it, fix the bookkeeping.
+      entry.action = "already-confirmed";
+      if (execute && rec) { rec.reconciled = true; rec.updatedAt = Date.now(); }
+      orphans.push(entry);
+      continue;
+    }
+    if (chainStatus === "held" && Number(chainBooking.hold_expiry || 0) * 1000 > now) {
+      entry.reason = "hold still active on chain; confirm can still land";
+      orphans.push(entry);
+      continue;
+    }
+    // Unsealable order (booking cancelled on-chain, or held past its window):
+    // cancelling recovers the provider balance without stranding a ticket.
+    entry.action = "cancel";
+    if (!execute) {
+      orphans.push(entry);
+      continue;
+    }
+    // Idempotency: an order the provider already shows cancelled reconciles
+    // without a second cancel call.
+    try {
+      const live = await liveOrderStatus(o.orderId);
+      if (live && live.status === "cancelled") {
+        entry.cancelled = true;
+        entry.alreadyCancelled = true;
+        cancelled.push(o.orderId);
+        if (rec) { rec.reconciled = true; rec.status = "cancelled"; rec.updatedAt = Date.now(); }
+        orphans.push(entry);
+        continue;
+      }
+    } catch { /* live check is best-effort; the cancel below still runs */ }
+    const base = String(BOOKING_PROVIDER_URL || "").trim().replace(/\/book\/?$/, "");
+    try {
+      const r = await fetch(`${base}/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(BOOKING_PROVIDER_API_KEY ? { Authorization: `Bearer ${BOOKING_PROVIDER_API_KEY}` } : {}) },
+        body: JSON.stringify({ orderId: o.orderId }),
+      });
+      const j = await r.json().catch(() => ({}));
+      const errText = String(j.error || "");
+      if (r.ok) {
+        entry.cancelled = true;
+        cancelled.push(o.orderId);
+        if (rec) { rec.reconciled = true; rec.status = "cancelled"; rec.updatedAt = Date.now(); }
+      } else if (/already\s+(?:been\s+)?cancelled/i.test(errText)) {
+        // Idempotent: the order was cancelled by an earlier run (Duffel 422s
+        // re-cancellation; the provider forwards its wording verbatim).
+        entry.cancelled = true;
+        entry.alreadyCancelled = true;
+        cancelled.push(o.orderId);
+        if (rec) { rec.reconciled = true; rec.status = "cancelled"; rec.updatedAt = Date.now(); }
+      } else {
+        entry.cancelError = errText || `cancel failed (${r.status})`;
+      }
+    } catch (e) {
+      entry.cancelError = e.message;
+    }
+    orphans.push(entry);
   }
+  if (execute) saveReservations();
   return res.json({ expired, orphans, cancelled: execute ? cancelled : undefined });
 });
 
@@ -1353,7 +1460,8 @@ app.post("/api/reservations/:ref/status", statusLimiter, (req, res) => {
     return res.status(401).json({ error: "unauthorized" });
   }
   const ref = String(req.params.ref || "").trim().toUpperCase();
-  if (!ref || !/^[A-Z0-9]{4,12}$/.test(ref)) {
+  // Same shape rule as GET /status: hyphen admits this server's HOLD- refs.
+  if (!ref || !/^[A-Z0-9-]{4,16}$/.test(ref)) {
     return res.status(400).json({ error: "invalid reservation ref" });
   }
   const status = String(req.body?.status || "").trim().toLowerCase();
