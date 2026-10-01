@@ -271,9 +271,14 @@ async function createHoldViaProvider(from, to, departIso) {
   const j = await res.json().catch(() => ({}));
   if (!res.ok) {
     console.error("[quote-server] offer-hold failed:", res.status, j.error || "");
-    const err = new Error(j.error || `offer-hold failed (${res.status})`);
+    // A 429 with no JSON error body is the platform edge (Render) throttling us,
+    // not Duffel — say so; it changes how callers should back off.
+    const fallback = res.status === 429
+      ? "rate limited before reaching the travel provider (429) — retry in ~30s"
+      : `offer-hold failed (${res.status})`;
+    const err = new Error(j.error || fallback);
     err.status = res.status;
-    err.retryAfter = j.retryAfter || res.headers.get("retry-after") || undefined;
+    err.retryAfter = j.retryAfter || res.headers.get("retry-after") || (res.status === 429 ? "30" : undefined);
     throw err;
   }
   if (!j.offerId) throw new Error("offer-hold returned no offerId");

@@ -201,7 +201,16 @@ export default function Book() {
           break;
         } catch (e) {
           const is429 = e.status === 429 || /429/.test(e.message || "");
-          if (!is429 || attempt >= 2) throw e;
+          if (!is429 || attempt >= 2) {
+            if (is429) {
+              console.warn("hold retries exhausted:", e.message);
+              throw new Error(
+                "Travel network is rate-limiting us (429) — it usually clears within a minute or two. " +
+                "Wait a moment, then press Book again."
+              );
+            }
+            throw e;
+          }
           // Our own per-IP throttle recovers in seconds; Duffel's window is
           // honored in full (cap 3 min) so retries never fire into a live cooldown.
           const ownLimit = /local rate limit/i.test(e.message || "");

@@ -1,5 +1,16 @@
 # Changelog
 
+## v3.3 — rate-limit diagnostics (`v3.3-429-diagnostics`)
+
+Booking-429 triage: the frontend already retries holds 3× and provider Duffel
+cooldowns honor Retry-After; this pass makes the remaining opaque 429 legible.
+The bare "offer-hold failed (429)" fallback meant a non-JSON 429 (Render edge
+throttle, not Duffel) — the server now labels it and defaults Retry-After to
+30s; the frontend's final failure says "wait a minute, press Book again"
+instead of raw jargon; provider /health reports active Duffel cooldowns
+(`duffel429Cooldowns`, `duffelCooldownRetryInS`). Verified live: /offer-hold
+returned a real 200 hold immediately after a reported 429 burst.
+
 ## v3.2 — one-command contract redeploy (`v3.2-redeploy`)
 
 **Redeployed contract (2026-10-01): `0x5af83EFa1aED6aDa1CdA20f3604F37e8DC407d96`**

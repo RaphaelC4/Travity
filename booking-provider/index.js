@@ -76,7 +76,19 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "travity-booking-provider", duffelConfigured: Boolean(String(process.env.DUFFEL_API_KEY || "").trim()), providerKeyConfigured: Boolean(PROVIDER_API_KEY), commit: String(process.env.RENDER_GIT_COMMIT || "local").slice(0, 7) }));
+app.get("/health", (_req, res) => {
+  const now = Date.now();
+  const cooling = [..._offer429Cache.values()].filter((c) => now < c.until);
+  return res.json({
+    ok: true,
+    service: "travity-booking-provider",
+    duffelConfigured: Boolean(String(process.env.DUFFEL_API_KEY || "").trim()),
+    providerKeyConfigured: Boolean(PROVIDER_API_KEY),
+    commit: String(process.env.RENDER_GIT_COMMIT || "local").slice(0, 7),
+    duffel429Cooldowns: cooling.length,
+    duffelCooldownRetryInS: cooling.length ? Math.max(...cooling.map((c) => Math.ceil((c.until - now) / 1000))) : 0,
+  });
+});
 
 // Own per-IP rate limit. Custom JSON body (not the default text) so upstream
 // can tell OUR throttle apart from Duffel's: ours says "local rate limit".
