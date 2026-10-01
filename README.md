@@ -88,7 +88,8 @@ Set in `booking-provider/.env` / Render `travity-booking-provider`: `DUFFEL_API_
 5. On the Book page connect your wallet — **Hold** locks escrow (`HELD`), **Confirm purchase** seals Duffel `ord_…`/`PNR` (`CONFIRMED`), **Settle** after `duffel-live completed`/`aviation landed` + `6h` window → `COMPLETED` + loyalty. `Review & pay` pills derive `HELD`/`CONFIRMED`/`COMPLETED` from `view_booking` and refresh on mount + after each write.
 
 Deployed contracts (Studionet):
-- `0x93917fdeb92E31B108F002368229d8bbE9C7406e` — `v3-hold-confirm` (`f82142c`) hold→confirm build (current, use this)
+- `0x5af83EFa1aED6aDa1CdA20f3604F37e8DC407d96` — `v3.2` clean redeploy of the `v3-hold-confirm` source, 2026-10-01 (current, use this; owner `0xc048…4Fd1`)
+- `0x93917fdeb92E31B108F002368229d8bbE9C7406e` — `v3-hold-confirm` (`f82142c`) hold→confirm build (superseded 2026-10-01)
 - `0x601e602C50bc2048ac8033C21e16Ce4D3712e48D` — `105ed6a` hold→confirm build (superseded)
 - `0x774eFD6bB076fCB270e1bb596d8c0335e5895D27` — legacy 9-arg book (deprecated)
 
