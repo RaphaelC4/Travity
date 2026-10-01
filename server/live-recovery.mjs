@@ -77,7 +77,7 @@ if (DRY_RUN) {
 
 // 3. On-chain hold_booking escrow (spends test GEN).
 const account = privateKeyToAccount(process.env.WALLET_PRIVATE_KEY);
-const client = createClient({ chain: studionet, endpoint: RPC, account: account.address });
+const client = createClient({ chain: studionet, endpoint: RPC, account }); // signer account object — the SDK requires signTransaction (a bare address cannot sign writes)
 await client.writeContract({ address: CONTRACT, functionName: "refresh_quote", args: [o, d, Number(DEPART), Number(RET)], value: 0n });
 const agreed = await client.readContract({ address: CONTRACT, functionName: "view_quote", args: [o, d, Number(DEPART), Number(RET)] });
 const price = BigInt(agreed.price_wei ?? agreed.priceWei);

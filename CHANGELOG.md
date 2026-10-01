@@ -1,5 +1,27 @@
 # Changelog
 
+## v3.2 — one-command contract redeploy (`v3.2-redeploy`)
+
+**Redeployed contract (2026-10-01): `0x5af83EFa1aED6aDa1CdA20f3604F37e8DC407d96`**
+(deploy tx `0x061abf7ba43d99aa663f26738fd4de84be2ee9fec6c60b9fd34ce7b7b4aab8d8`,
+owner `0xc048…4Fd1`, FINALIZED, `view_provider_config` verified at `latest-final`).
+All three env files point at it; the old `0x9391…7406e` is retired.
+
+`scripts/deploy-contract.mjs`: generates a fresh deployer key, funds it from
+the studionet faucet (`sim_fundAccount` — no operator wallet export needed),
+deploys `contracts/travel_agent.py`, waits for the receipt, extracts the new
+address and verifies the contract answers `view_provider_config` at FINALIZED
+state. Owner defaults to `VITE_GENLAYER_OWNER_ADDRESS` so the existing admin
+wallet keeps ownership. `--write-env` rewrites the address into `.env`,
+`frontend/.env` and `server/.env`; `--dry-run` validates everything without
+spending.
+
+Also fixed: `server/live-recovery.mjs` passed `account.address` (a string) to
+`createClient`, but the SDK requires a signer account object for writes
+("Local account does not support signTransaction") — every write in the
+live-recovery run would have failed. It now passes the `privateKeyToAccount`
+object.
+
 ## v3.1 — reaper safety + integration tests (`v3.1-reaper-safety`)
 
 `POST /api/reaper` no longer cancels paid Duffel orders on its own authority.
