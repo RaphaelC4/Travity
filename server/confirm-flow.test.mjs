@@ -7,7 +7,9 @@
 // Covers: reserve -> confirm-purchase happy path (exactly one provider charge,
 // cached idempotent re-confirm), every fail-closed confirm branch (RPC down,
 // unknown booking, wrong offer, expired hold, no escrow, provider 500 with
-// retry), and the reaper's trust boundary: an orphan order backed by an
+// retry), airline phone rejection fixed in place (422 invalid_phone ->
+// corrected contact_phone on the same escrow, no second hold/charge), and the
+// reaper's trust boundary: an orphan order backed by an
 // on-chain-confirmed booking is kept and reconciled, never cancelled; failed
 // chain reads are fail-closed; cancels are idempotent.
 import http from "node:http";
@@ -58,6 +60,7 @@ const provSrv = http.createServer((rq, rs) => {
     if (p === "/__mode") {
       const m = JSON.parse(b || "{}");
       if ("failConfirm" in m) prov.mode.failConfirm = Boolean(m.failConfirm);
+      if ("failPhone" in m) prov.mode.failPhone = Number(m.failPhone) || 0;
       return reply(200, { ok: true, mode: prov.mode });
     }
     if (String(rq.headers.authorization || "") !== `Bearer ${PROV_KEY}`) return reply(401, { error: "unauthorized" });
@@ -73,6 +76,10 @@ const provSrv = http.createServer((rq, rs) => {
     }
     if (p === "/fake/confirm") {
       prov.confirm.push(b);
+      if (prov.mode.failPhone > 0) {
+        prov.mode.failPhone--;
+        return reply(422, { error: "Duffel create order 422 (phone_number): Invalid phone number", code: "invalid_phone" });
+      }
       if (prov.mode.failConfirm) return reply(502, { error: "duffel upstream exploded" });
       const n = ++provSeq;
       const id = `ord_${n}`;
@@ -268,6 +275,44 @@ console.log("== confirm-purchase: provider failure keeps the offer retryable =="
   const ok = await req("POST", `${BASE}/api/confirm-purchase`, { bookingId: bid(6), offerId: "off5ABCD" }, opHeaders);
   ck(ok.status === 200 && ok.j.duffelOrderId, `same offer confirms after provider recovers (${ok.status})`);
 }
+console.log("== confirm-purchase: airline phone rejection is fixable on the same escrow =="); {
+  const r4 = await req("POST", `${BASE}/api/reserve`, { from: "LOS", to: "JFK", depart: "20260915", ret: "20260922", passenger: PII });
+  const offerR = String(r4.j.offerId || "");
+  const seqN = parseInt(offerR.replace(/^off/, "").replace(/ABCD$/, ""), 10);
+  ck(r4.status === 201 && !Number.isNaN(seqN), `reserve for phone-retry flow (${r4.status} ${offerR})`);
+  seedChain(seqN, { offer_id: offerR });
+  const confirmsBefore = prov.confirm.length;
+  const holdsBefore = prov.offerHold.length;
+  await req("POST", `http://127.0.0.1:${PROV_PORT}/__mode`, { failPhone: 2 });
+  // (1) Duffel rejects the airline-side phone -> structured 422, escrow untouched
+  const p1 = await req("POST", `${BASE}/api/confirm-purchase`, { bookingId: bid(seqN), offerId: offerR }, opHeaders);
+  ck(p1.status === 422 && p1.j.code === "invalid_phone" && /corrected contact_phone/i.test(p1.j.error || ""), `airline phone rejection -> 422 invalid_phone with fix guidance (${p1.status} ${JSON.stringify(p1.j).slice(0, 120)})`);
+  ck(prov.confirm.length === confirmsBefore + 1, "exactly one provider attempt for the rejected confirm");
+  const rec1 = Object.values(readRecs()).find((v) => v.offerId === offerR);
+  ck(rec1 && !rec1.providerOrderId && rec1.status === "offer_held", "rejected confirm leaves the hold unconfirmed and retryable");
+  // (2) Blind retry (same stored phone) hits the airline again — still fixable, no new hold
+  const p2 = await req("POST", `${BASE}/api/confirm-purchase`, { bookingId: bid(seqN), offerId: offerR }, opHeaders);
+  ck(p2.status === 422 && p2.j.code === "invalid_phone", `retry with unchanged phone fails the same way (${p2.status})`);
+  ck(prov.offerHold.length === holdsBefore, "no new offer hold was created by the retries (same escrow)");
+  // (3) Malformed corrected phone is caught by OUR validator before the provider
+  const beforeBad = prov.confirm.length;
+  const badFix = await req("POST", `${BASE}/api/confirm-purchase`, { bookingId: bid(seqN), offerId: offerR, contact_phone: "08012345678" }, opHeaders);
+  ck(badFix.status === 422 && badFix.j.code === "invalid_phone" && /international format/i.test(badFix.j.error || ""), `malformed correction rejected locally (${badFix.status} ${badFix.j.error})`);
+  ck(prov.confirm.length === beforeBad, "malformed correction never reached the provider");
+  // (4) Corrected phone: validated, persisted, order created on the SAME escrow
+  await req("POST", `http://127.0.0.1:${PROV_PORT}/__mode`, { failPhone: 0 });
+  const p3 = await req("POST", `${BASE}/api/confirm-purchase`, { bookingId: bid(seqN), offerId: offerR, contact_phone: "+12125550123" }, opHeaders);
+  ck(p3.status === 200 && /^ord_/.test(p3.j.duffelOrderId || ""), `corrected phone completes the purchase (${p3.status} ${p3.j.duffelOrderId})`);
+  const lastConfirmBody = JSON.parse(prov.confirm[prov.confirm.length - 1] || "{}");
+  ck(lastConfirmBody.passenger?.phone_number === "+12125550123", "provider received the corrected E.164 phone");
+  ck(prov.offerHold.length === holdsBefore, "no second escrow: same hold purchased");
+  const rec2 = Object.values(readRecs()).find((v) => v.offerId === offerR);
+  ck(rec2 && rec2.status === "confirmed" && rec2.providerOrderId === p3.j.duffelOrderId && rec2.bookingId === bid(seqN), "record confirmed on the corrected phone");
+  ck(rec2.passengerPII?.phone_number === "+12125550123", "corrected phone persisted on the held record");
+  // (5) Idempotent after recovery
+  const p4 = await req("POST", `${BASE}/api/confirm-purchase`, { bookingId: bid(seqN), offerId: offerR, contact_phone: "+12125550123" }, opHeaders);
+  ck(p4.status === 200 && p4.j.cached === true, "re-confirm after fix returns the cached receipt");
+}
 console.log("== confirm-purchase: auth + unheld guards (review) =="); {
   const r = await req("POST", `${BASE}/api/reserve`, { from: "LOS", to: "JFK", depart: "20260915", ret: "20260922", passenger: PII });
   const noAuth = await req("POST", `${BASE}/api/confirm-purchase`, { bookingId: bid(9), offerId: r.j.offerId });
@@ -285,7 +330,8 @@ console.log("== reaper: auth, dry-run, expired holds =="); {
   const dry = await req("POST", `${BASE}/api/reaper`, {}, opHeaders);
   ck(dry.status === 200 && dry.j.cancelled === undefined, "dry run performs no cancels");
   ck(Array.isArray(dry.j.expired) && dry.j.expired.some((e) => e.ref === "SEEDOLD"), "aged never-purchased hold listed as expired");
-  ck(dry.j.orphans.length === 3 && dry.j.orphans.every((o) => /hold still active/.test(o.reason || "")), "fresh orders with active chain holds are skipped, not cancelled");
+  const knownActive = ["ord_2", "ord_4", "ord_6"].every((id) => dry.j.orphans.some((o) => o.orderId === id && /hold still active/.test(o.reason || "")));
+  ck(knownActive && dry.j.orphans.every((o) => /hold still active/.test(o.reason || "")), "fresh orders with active chain holds are skipped, not cancelled");
   ck(prov.cancel.length === 0, "dry run made no provider cancel calls");
 }
 console.log("== reaper: confirmed booking keeps its paid order (regression) =="); {

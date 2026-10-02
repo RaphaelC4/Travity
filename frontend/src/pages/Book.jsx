@@ -70,6 +70,10 @@ export default function Book() {
   const [booking, setBooking] = useState(restored?.booking ?? null);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState(null);
+  // Purchase retry: a booking whose escrow is already locked but whose Duffel
+  // order was rejected (airline refused the contact phone). Pressing the same
+  // pay button retries ONLY the purchase — no second hold, no second escrow.
+  const [purchaseRetry, setPurchaseRetry] = useState(null);
   const wallet = useWallet();
   const live = client.live;
   const needsWallet = live && wallet.status !== "connected";
@@ -119,6 +123,11 @@ export default function Book() {
     if (!parsed.isPossible()) {
       return { error: "Wrong digit count for that country — check and re-enter, e.g. +2348012345678." };
     }
+    // Duffel applies full numbering-plan rules at order time; a length-only
+    // gate let plausible fakes (e.g. +2341234…) pass, lock escrow, then 422.
+    if (!parsed.isValid()) {
+      return { error: "That number isn't a real one for its country — check the prefix and re-enter, e.g. +2348012345678." };
+    }
     return { e164: parsed.number };
   };
 
@@ -143,6 +152,7 @@ export default function Book() {
     const origin = form.origin.trim().toUpperCase();
     const destination = form.destination.trim().toUpperCase();
     setQuote(null);
+    setPurchaseRetry(null);
     if (!/^[A-Z]{3}$/.test(origin) || !/^[A-Z]{3}$/.test(destination) || origin === destination) {
       setErrors({ origin: "Use two distinct 3-letter IATA codes (e.g. JFK / LHR)." });
       return;
@@ -163,6 +173,54 @@ export default function Book() {
     }
   }
 
+  // Retry ONLY the Duffel purchase for a booking whose escrow is already
+  // locked (airline rejected the contact phone). Same hold, same escrow, no
+  // second payment; the corrected phone is validated here and server-side,
+  // then persisted on the held reservation before the provider call.
+  async function completePurchase(ctx, phone) {
+    setBusy(true);
+    try {
+      const walletSig = await client.signConfirmPurchase({ bookingId: ctx.bookingId, offerId: ctx.offerId, account: wallet.account, provider: wallet.provider });
+      const base = (import.meta.env.VITE_QUOTE_API || "").replace(/\/+$/, "");
+      const res = await fetch(`${base}/api/confirm-purchase`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Wallet-Address": wallet.account, "X-Wallet-Signature": walletSig },
+        body: JSON.stringify({ bookingId: ctx.bookingId, offerId: ctx.offerId, passengerId: ctx.passengerId, contact_phone: phone }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (res.status === 422 && j.code === "invalid_phone") {
+          setErrors((prev) => ({ ...prev, "traveler.phone_number": j.error || "The airline rejected this phone number." }));
+          showToast("Still rejected: " + (j.error || "airline rejected the phone") + " — fix the number and press the pay button again.", "alert");
+          return; // keep retry state — the escrow is still ours
+        }
+        if ([404, 409, 410].includes(res.status)) {
+          setPurchaseRetry(null); // escrow can no longer be sealed — start fresh
+        }
+        showToast("Booking failed: " + (j.error || `Duffel purchase failed (${res.status})`), "alert");
+        return;
+      }
+      const orderId = String(j.duffelOrderId || j.orderId || "");
+      const locator = String(j.locator || "");
+      if (!orderId || !locator) {
+        showToast("Booking failed: confirm purchase returned no order/locator.", "alert");
+        return;
+      }
+      await client.confirmPurchase({ bookingId: ctx.bookingId, orderId, locator, account: wallet.account, provider: wallet.provider });
+      const sealedRef = locator.toUpperCase();
+      setBooking({ id: ctx.bookingId, route: quote?.route ?? "", priceWei: BigInt(ctx.agreedWei || "0"), reservationRef: sealedRef, status: "confirmed", completion: false });
+      try { const live = await client.bookings(); const found = live.find((b) => b.id === ctx.bookingId); if (found) setBooking((prev) => ({ ...prev, status: found.status || "confirmed" })); } catch {}
+      setQuote(null);
+      setPurchaseRetry(null);
+      setErrors((prev) => ({ ...prev, "traveler.phone_number": undefined }));
+      showToast(`Trip booked (PNR ${sealedRef}): fare escrowed at the on-chain agreed price (network gas was charged separately).`, "status");
+    } catch (err) {
+      showToast("Booking failed: " + (err.message || "unknown error"), "alert");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function confirmBooking() {
     if (!quote) return;
     const tErrs = validateTraveler(form.traveler);
@@ -172,8 +230,18 @@ export default function Book() {
       return;
     }
     // Send Duffel the canonical number (e.g. +2340803… → +234803…).
-    const { e164: canonicalPhoneNumber } = canonicalPhone(form.traveler.phone_number);
+    const { e164: canonicalPhoneNumber, error: phoneErr } = canonicalPhone(form.traveler.phone_number);
+    if (phoneErr) {
+      setErrors((prev) => ({ ...prev, "traveler.phone_number": phoneErr }));
+      showToast("Booking failed: " + phoneErr, "alert");
+      return;
+    }
     const traveler = { ...form.traveler, phone_number: canonicalPhoneNumber };
+    // A purchase already in flight (escrow locked) retries without a new hold/escrow.
+    if (purchaseRetry) {
+      await completePurchase(purchaseRetry, canonicalPhoneNumber);
+      return;
+    }
     setBusy(true);
     try {
       // Two-step: 1) hold offer (no Duffel charge), 2) escrow on-chain, 3) purchase Duffel, 4) seal receipt
@@ -252,7 +320,16 @@ export default function Book() {
         body: JSON.stringify({ bookingId: holdRes.id, offerId, passengerId: pasId }),
       });
       const confJson = await confRes.json().catch(() => ({}));
-      if (!confRes.ok) throw new Error(confJson.error || `Duffel purchase failed (${confRes.status})`);
+      if (!confRes.ok) {
+        if (confRes.status === 422 && confJson.code === "invalid_phone") {
+          // Airline rejected the phone AFTER escrow locked: keep the escrow,
+          // let the user correct the number and re-press the same button.
+          setPurchaseRetry({ bookingId: holdRes.id, offerId, passengerId: pasId, agreedWei: quote.escrowWei.toString() });
+          setErrors((prev) => ({ ...prev, "traveler.phone_number": confJson.error || "The airline rejected this phone number." }));
+          throw new Error(confJson.error || "The airline rejected the contact phone — correct it above, then press the pay button again (no new payment will be taken).");
+        }
+        throw new Error(confJson.error || `Duffel purchase failed (${confRes.status})`);
+      }
       const orderId = String(confJson.duffelOrderId || confJson.orderId || "");
       const locator = String(confJson.locator || "");
       if (!orderId || !locator) throw new Error("Confirm purchase failed — no order/locator returned");
@@ -436,10 +513,17 @@ export default function Book() {
               </div>
             ) : (
               <button className="btn btn-accent" onClick={confirmBooking} disabled={busy}>
-                {quote.agreed
+                {purchaseRetry
+                  ? "Fix phone & complete booking (no new payment)"
+                  : quote.agreed
                   ? `Pay ${fmtGen(quote.escrowWei)} and book`
                   : `Pay ${quote.usdTotal != null ? fmtUsd(quote.usdTotal, quote.usdCurrency) : fmtGen(quote.escrowWei)} and book`}
               </button>
+              {purchaseRetry && (
+                <p className="hint" style={{ marginTop: 8 }}>
+                  Your payment is already escrowed for this trip. Fix the phone number above, then press this button — only the ticket purchase is retried.
+                </p>
+              )}
             )}
 
             {booking && (

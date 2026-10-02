@@ -53,6 +53,9 @@ function normalizePhone(raw) {
   if (!parsed.isPossible()) {
     return { error: "passenger.phone_number has wrong digit count for its country — check and re-enter, e.g. +2348012345678" };
   }
+  if (!parsed.isValid()) {
+    return { error: "passenger.phone_number is not a real, reachable number for its country — double-check the prefix and re-enter, e.g. +2348012345678" };
+  }
   return { e164: parsed.number };
 }
 
@@ -391,9 +394,15 @@ app.post("/confirm", limiter, requireProviderAuth, async (req, res) => {
     const locator = String(orderJson.data?.booking_reference ?? orderJson.data?.id ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
     return res.json({ duffelOrderId: orderJson.data?.id ?? null, locator, refundPolicy: refundPolicyFrom(orderJson.data?.conditions) });
   } catch (e) {
+    // A phone rejection is a caller-fixable 422, not a server fault: tag it so
+    // the quote-server can answer 422 + code:"invalid_phone" and the UI can
+    // offer fix-and-retry on the same escrow instead of a dead end.
+    const phoneErr = Array.isArray(e.duffelErrors) &&
+      e.duffelErrors.some((x) => /phone/i.test(String(x?.source?.field ?? x?.source?.pointer ?? "")));
     const out = { error: `confirm failed: ${e.message}` };
+    if (phoneErr) out.code = "invalid_phone";
     if (Array.isArray(e.duffelErrors)) out.duffelErrors = e.duffelErrors;
-    return res.status(502).json(out);
+    return res.status(phoneErr ? 422 : 502).json(out);
   }
 });
 

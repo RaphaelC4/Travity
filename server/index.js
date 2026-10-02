@@ -294,19 +294,31 @@ async function validPassengerPIIAsync(p) {
   }
   if (Number.isNaN(Date.parse(String(p.born_on)))) return "passenger.born_on must be a valid date";
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(p.email))) return "passenger.email invalid";
-  // Mirror the provider gate: canonical libphonenumber parse, not regex shape.
-  // (Trunk-0 numbers like +2340803… pass E.164 shape yet Duffel 422s them.)
+  const ph = await validatePhoneE164(p.phone_number);
+  if (ph.error) return ph.error;
+  return null;
+}
+
+// Canonicalize a phone to library E.164 and require it to be genuinely valid —
+// a real number in its country's numbering plan, not merely the right length.
+// Duffel applies full libphonenumber rules at order time; a length-only gate
+// let plausible fakes (e.g. +2341234…) pass, lock escrow, and only then 422.
+// Returns { e164 } or { error }.
+async function validatePhoneE164(raw) {
   let parsed;
   try {
     const { parsePhoneNumber } = await import("libphonenumber-js");
-    parsed = parsePhoneNumber(String(p.phone_number ?? ""));
+    parsed = parsePhoneNumber(String(raw ?? ""));
   } catch {
-    return "passenger.phone_number must be international format starting with +, e.g. +2348012345678 (not 0801…)";
+    return { error: "passenger.phone_number must be international format starting with +, e.g. +2348012345678 (not 0801…)" };
   }
   if (!parsed.isPossible()) {
-    return "passenger.phone_number has wrong digit count for its country — check and re-enter, e.g. +2348012345678";
+    return { error: "passenger.phone_number has wrong digit count for its country — check and re-enter, e.g. +2348012345678" };
   }
-  return null;
+  if (!parsed.isValid()) {
+    return { error: "passenger.phone_number is not a real, reachable number for its country — double-check the prefix and re-enter, e.g. +2348012345678" };
+  }
+  return { e164: parsed.number };
 }
 
 async function createOrderViaProvider(offerId, passengerId, totalAmount, totalCurrency, passenger) {
@@ -324,7 +336,13 @@ async function createOrderViaProvider(offerId, passengerId, totalAmount, totalCu
   const j = await res.json().catch(() => ({}));
   if (!res.ok) {
     console.error("[quote-server] confirm failed:", res.status, j.error || "");
-    throw new Error(j.error || `booking provider confirm failed (${res.status})`);
+    const err = new Error(j.error || `booking provider confirm failed (${res.status})`);
+    // Propagate structured failure kinds: an airline phone rejection is
+    // retryable in place (fix the number, same escrow) — the confirm handler
+    // keys off err.code to answer 422 instead of a generic 502.
+    if (j.code) err.code = j.code;
+    if (Array.isArray(j.duffelErrors)) err.duffelErrors = j.duffelErrors;
+    throw err;
   }
   if (!j.duffelOrderId) throw new Error("booking provider returned no order id");
   return { duffelOrderId: j.duffelOrderId, locator: j.locator, refundPolicy: j.refundPolicy };
@@ -1084,6 +1102,9 @@ app.post("/api/confirm-purchase", reserveLimiter, async (req, res) => {
   const bookingId = String(req.body?.bookingId || req.body?.booking_id || "").trim();
   const offerId = String(req.body?.offerId || req.body?.offer_id || "").trim();
   const passengerId = String(req.body?.passengerId || req.body?.passenger_id || "").trim();
+  // Optional corrected contact phone: lets a customer whose phone was rejected
+  // by the airline fix it in place — same hold, same escrow, no second lock.
+  const contactPhone = String(req.body?.contact_phone || req.body?.contactPhone || "").trim();
   if (!bookingId || !offerId) return res.status(400).json({ error: "bookingId and offerId required" });
   // Dual auth: operator token OR customer wallet signature (ecRecovered here,
   // enforced again on-chain by confirm_purchase's only-booking-customer check).
@@ -1176,10 +1197,23 @@ app.post("/api/confirm-purchase", reserveLimiter, async (req, res) => {
       return res.status(409).json({ error: "offer held for another booking" });
     }
     if (!holdRec.passengerPII) return res.status(409).json({ error: "held offer has no passenger record; re-hold with traveler details" });
+    // Apply a corrected contact phone before the Duffel call: strictly
+    // validated and persisted, so this retry and every future attempt use it.
+    if (contactPhone) {
+      const ph = await validatePhoneE164(contactPhone);
+      if (ph.error) return res.status(422).json({ error: ph.error, code: "invalid_phone" });
+      holdRec.passengerPII = { ...holdRec.passengerPII, phone_number: ph.e164 };
+      saveReservations();
+    }
     let order;
     try {
       order = await createOrderViaProvider(offerId, passengerId, holdRec?.totalAmount, holdRec?.totalCurrency, holdRec.passengerPII);
     } catch (e) {
+      // Airline rejected the contact phone: a 422 the customer can fix — the
+      // escrow is untouched and this exact hold can still be purchased.
+      if (e.code === "invalid_phone") {
+        return res.status(422).json({ error: "The airline rejected the contact phone on this booking. Re-submit with a corrected contact_phone (international format, e.g. +2348012345678) — your escrow is untouched and this same hold can still be purchased.", code: "invalid_phone" });
+      }
       // Surface the provider/Duffel reason verbatim (price mismatch, balance,
       // offer expired) instead of a generic purchase failure.
       return res.status(502).json({ error: `Duffel purchase failed: ${e.message}` });

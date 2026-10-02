@@ -1,5 +1,30 @@
 # Changelog
 
+## v3.4 — strict phone validation + fix-and-retry on the same escrow (`v3.4-phone-fix`)
+
+Duffel rejects orders with invalid contact phones (422 `phone_number`), but our
+three gates (frontend, server reserve/confirm gate, provider) only checked
+number *length* (`isPossible`), so plausible-but-fake numbers passed, escrow
+locked, and only Duffel's stricter validator bounced the purchase — with a
+retry that re-sent the same bad number forever.
+
+- All three gates now enforce full numbering-plan validity (`isValid` +
+  `isPossible` via libphonenumber) **before** escrow locks; the server's
+  message shows the expected format (`+2348012345678`, not `0801…`)
+- Duffel phone rejections are tagged `code: "invalid_phone"` end-to-end
+- `POST /api/confirm-purchase` accepts an optional corrected `contact_phone`
+  (or passenger `phone_number`): validates it, persists it on the held
+  reservation record, and retries the Duffel order on the **same escrow** —
+  no double lock, no new hold
+- Frontend Book flow: strict canonical check up front; on `invalid_phone` it
+  shows a phone-fix prompt that re-confirms the existing escrow
+- Tests: fake-provider `failPhone` mode; new suite block covers rejection
+  before any provider call, unchanged-phone retry failing identically,
+  malformed-correction rejection, corrected-phone completion, corrected E.164
+  reaching the provider, and record persistence (server suite ALL CHECKS
+  PASSED; provider 12/12). The phone-retry booking joins the reaper's
+  active-hold set, so the dry-run assertion is now count-independent.
+
 ## v3.3 — rate-limit diagnostics (`v3.3-429-diagnostics`)
 
 Booking-429 triage: the frontend already retries holds 3× and provider Duffel
